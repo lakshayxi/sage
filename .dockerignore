@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.git/
+.env
+tests/
+docs/
+data/raw/*
+data/processed/*
+db/sage.db
+!db/.gitkeep
+frontend/node_modules/
+frontend/dist/

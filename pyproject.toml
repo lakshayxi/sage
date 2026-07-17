@@ -1,0 +1,43 @@
+[project]
+name = "sage"
+version = "0.1.0"
+description = "Sage — an AI-native financial research workspace (backend/CLI core)"
+requires-python = ">=3.11"
+dependencies = [
+    "google-genai>=1.0",
+    "pymupdf>=1.24",
+    "chromadb>=0.5",
+    "sqlalchemy>=2.0",
+    "rank-bm25>=0.2",
+    "sentence-transformers>=3.0",
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "slowapi>=0.1.9",
+    "python-multipart>=0.0.9",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "fpdf2>=2.7",
+    "huggingface_hub>=0.25",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[project.scripts]
+sage = "sage.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sage*", "config*"]

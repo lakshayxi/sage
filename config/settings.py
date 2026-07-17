@@ -1,0 +1,144 @@
+"""Centralized configuration for Sage.
+
+Env-overridable with sensible local defaults, mirroring the pattern used by
+the reference local-first project this was built alongside. Generation is
+Gemini-only (via API key) — no local/cloud chat-provider switch or tier
+system to configure. Embeddings, by contrast, run locally (sentence-
+transformers) rather than through Gemini's embedding API — see
+sage/embed/local_embedder.py's module docstring for why (Gemini's free
+embedding quota turned out to be a hard, non-recoverable wall, and
+embeddings are needed on every single query, not just at ingest time).
+"""
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Nothing in this app previously loaded .env into the process environment --
+# GEMINI_API_KEY silently resolved to "" for every real run (uvicorn, the
+# CLI), which surfaced as a confusing "No API key was provided" ValueError
+# from google-genai deep in the call stack, easily mistaken for a quota/auth
+# problem with the key itself. load_dotenv() here is a no-op if the caller's
+# shell already exports these vars (e.g. in a deployed container), so this is
+# safe in both local and production environments.
+load_dotenv(BASE_DIR / ".env")
+
+# --- Paths ---
+DATA_DIR = BASE_DIR / "data"
+RAW_DIR = DATA_DIR / "raw"
+PROCESSED_DIR = DATA_DIR / "processed"
+CHROMA_DIR = DATA_DIR / "chroma"
+DB_DIR = BASE_DIR / "db"
+SQLITE_PATH = DB_DIR / "sage.db"
+
+# --- Gemini ---
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+# WebFetch against ai.google.dev/gemini-api/docs on 2026-07-17 showed
+# gemini-2.5-flash as a current, stable model -- but a LIVE call against a
+# real API key the same day got back "404 This model models/gemini-2.5-flash
+# is no longer available to new users" (gemini-2.5-flash-lite: same 404;
+# gemini-2.0-flash: quota-blocked, 429). Docs pages lag live model
+# availability more than expected -- don't trust WebFetch alone for a model
+# id that a real request will actually hit; live-verify before shipping.
+# "gemini-flash-latest" (a rolling alias Google documents for "current
+# recommended Flash model") worked live initially, but on 2026-07-18 started
+# returning a live "503 UNAVAILABLE / high demand" on every call against the
+# same key -- a Google-side capacity issue, not a quota/auth problem (ruled
+# out by testing gemini-2.0-flash on the same key in the same breath, which
+# correctly came back 429 quota-exhausted instead, a different error).
+# "gemini-flash-lite-latest" (Google's rolling alias for its lite Flash tier)
+# was live-verified working on the same key at the same time, so it's the
+# default until flash-latest's availability is confirmed stable again -- at
+# the cost of the concrete model (and therefore its exact price) potentially
+# changing without a code change on Google's side.
+GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-flash-lite-latest")
+
+# --- Embeddings (local, not Gemini -- see sage/embed/local_embedder.py) ---
+# BAAI/bge-small-en-v1.5, 384-d: same vendor as RERANKER_MODEL below, small
+# and fast enough to load in-process with no new heavy dependency
+# (sentence-transformers/PyTorch is already installed for the reranker).
+# Switching this changes vector dimensionality -- any existing Chroma
+# collection built under a different embedding model must be rebuilt
+# (delete data/chroma/ and re-ingest), not reused.
+LOCAL_EMBEDDING_MODEL = os.environ.get("SAGE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
+# --- Chunking ---
+CHUNK_TOKENS = 650  # target chunk size (word-count approximation), ~500-800 window
+CHUNK_OVERLAP_TOKENS = 120
+
+# --- Retrieval ---
+DEFAULT_TOP_K = 5
+# Wide candidate set fetched by hybrid (vector + BM25) retrieval before the
+# cross-encoder narrows it down to DEFAULT_TOP_K (or a caller-supplied top_k).
+# In multi-company mode this is the per-company candidate count, not a global
+# total -- see sage/retrieval/retriever.py.
+RERANK_CANDIDATE_K = 30
+RERANKER_MODEL = "BAAI/bge-reranker-base"
+# Minimum cross-encoder relevance score (sigmoid-applied, so in [0, 1]) for a
+# reranked chunk to be used to answer from. Chunks below this are dropped
+# before prompting; if none remain, the pipeline refuses to answer rather
+# than generating from irrelevant context. Reused unchanged from the
+# reference project's empirically-grounded value: manual probing there found
+# genuinely relevant (query, chunk) pairs scoring 0.59-0.9998 versus
+# off-topic pairs scoring 0.0000-0.0021 against the same BAAI/bge-reranker-base
+# model -- 0.1 sits in the gap between those two clusters. The reasoning
+# transfers directly since the reranker model and its sigmoid scoring are
+# unchanged; still worth re-validating against Sage's own corpus over time.
+MIN_RERANK_SCORE = 0.1
+
+# --- Chroma ---
+CHROMA_COLLECTION = "sage_chunks"
+CHROMA_QUERY_CACHE_COLLECTION = "sage_query_cache"
+# Max squared-L2 distance (Chroma's default hnsw:space) between a new query's
+# embedding and the closest cached one to still count as a semantic cache
+# hit. Unvalidated starting point (mirrors MIN_RERANK_SCORE's provenance) --
+# chosen to only catch near-identical phrasing, not tuned against real query
+# traffic yet.
+SEMANTIC_CACHE_THRESHOLD = 0.05
+
+# Max age (seconds) a cached answer stays valid before a lookup treats it as
+# a miss. Protecting the free Gemini quota matters more here than in the
+# reference (local, unmetered) project, so the cache is relied on more
+# heavily -- but a long TTL still risks masking a same-day prompt/parsing fix
+# behind a stale cached answer, so this keeps the reference's 6-hour value
+# rather than going longer.
+CACHE_TTL_SECONDS = 6 * 60 * 60
+
+# --- Cost estimation ---
+# $/1K-token rates, used to compute QueryLog.cost_usd. Checked via WebFetch
+# against ai.google.dev/gemini-api/docs/pricing on 2026-07-17 (paid-tier
+# rates; actual billing stays $0 while under the free-tier quota). Update
+# here if GEMINI_CHAT_MODEL is swapped to a model not listed below -- an
+# unlisted model falls back to a 0.0 rate rather than raising (see
+# sage/generation/cost.py). gemini-2.5-flash/-lite are kept here for
+# reference even though live-testing found them 404 for new users (see
+# GEMINI_CHAT_MODEL's comment) -- an existing account with prior access might
+# still be routed to them. "gemini-flash-latest" (the default) has no fixed
+# rate here since it's a rolling alias -- its cost estimate falls back to
+# 0.0 until it's pinned to a concrete model id. No entry for
+# LOCAL_EMBEDDING_MODEL: local embeddings run on this machine's own
+# CPU/GPU, so their cost is genuinely and always $0, not merely
+# falling back to the same default an unlisted cloud model would.
+MODEL_COST_PER_1K_TOKENS: dict[str, dict[str, float]] = {
+    "gemini-2.5-flash": {"prompt": 0.0003, "completion": 0.0025},
+    "gemini-2.5-flash-lite": {"prompt": 0.0001, "completion": 0.0004},
+    "gemini-3.5-flash": {"prompt": 0.0015, "completion": 0.009},
+}
+
+for _dir in (RAW_DIR, PROCESSED_DIR, CHROMA_DIR, DB_DIR):
+    _dir.mkdir(parents=True, exist_ok=True)
+
+# --- API ---
+# Shared demo-access key for the public deployment: unset (None) locally, so
+# api/middleware.py's DemoKeyMiddleware is a complete no-op by default.
+DEMO_ACCESS_KEY = os.environ.get("DEMO_ACCESS_KEY") or None
+# Curated-demo boundary for the public deployment -- set to "false" there so
+# POST /documents/upload 403s instead of accepting arbitrary uploads.
+ALLOW_UPLOADS = os.environ.get("ALLOW_UPLOADS", "true").lower() != "false"
+# slowapi rate-limit spec string, applied to POST /chat and GET /chat/stream
+# to protect the free Gemini quota behind the public deployment.
+CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "10/minute")

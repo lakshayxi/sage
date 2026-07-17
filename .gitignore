@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+data/raw/*
+data/processed/*
+data/chroma/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/chroma/.gitkeep
+/db/
+*.db
+# The pre-ingested demo corpus baked into the HF Spaces image is a real
+# deployment artifact, not local dev/runtime state -- exempt it from the
+# blanket `*.db` ignore above so it actually gets committed.
+!deploy/huggingface/prebuilt/sage.db
+.env
+*.egg-info/

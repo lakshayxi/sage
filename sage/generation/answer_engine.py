@@ -1,0 +1,531 @@
+"""Orchestrates cache-lookup -> hybrid retrieve -> rerank -> prompt -> generate ->
+parse citations -> cache-store.
+
+`companies: list[str] | None` flows through this whole path (retrieval,
+cache key, and the query log) rather than a singular `company`, matching
+`retrieve_hybrid`'s signature -- see sage/retrieval/retriever.py's module
+docstring for why plural-from-the-start matters for Sage's comparison
+feature.
+"""
+
+import json
+import logging
+import re
+import time
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field
+
+from config import settings
+from sage.db.conversations import HistoryTurn
+from sage.db.query_log import record_query_log
+from sage.generation.cache import get_cached, get_semantic_cached, make_cache_key, store_cached
+from sage.generation.cost import estimate_cost_usd
+from sage.generation.gemini_client import GeminiChatClient, StreamDone, StreamToken
+from sage.generation.prompts import build_messages
+from sage.retrieval.reranker import rerank
+from sage.retrieval.retriever import RetrievedChunk, retrieve_hybrid
+
+CITATIONS_FENCED_RE = re.compile(r"```citations\s*\n(.*?)```", re.DOTALL)
+# Fallback for a model that drops the backtick fence but still labels the
+# block and ends the response with a JSON array -- carried over defensively
+# from the reference project (observed there with llama3.1 8B); Gemini's
+# actual behavior here is unverified without a live key (see prompts.py).
+CITATIONS_UNFENCED_RE = re.compile(r"\n?citations\s*\n(\[.*\])\s*\Z", re.DOTALL | re.IGNORECASE)
+UNCLOSED_CITATIONS_RE = re.compile(r"```citations|\n?citations\s*\n\[", re.IGNORECASE)
+BARE_TRAILING_FENCE_RE = re.compile(r"\n*```\s*\Z")
+
+# Returned when reranking finds nothing above settings.MIN_RERANK_SCORE -- the
+# LLM is never called in this case, so there's zero risk of it hallucinating
+# an answer from irrelevant context (and zero Gemini quota spent on it).
+NO_RELEVANT_CONTEXT_ANSWER = (
+    "I don't have information in the ingested documents that's relevant to this question."
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class Citation:
+    n: int
+    chunk_id: int
+    text: str
+    page_number: int | None
+    company: str | None
+    fiscal_year: str | None
+    doc_type: str | None
+    filename: str
+
+
+@dataclass
+class AnswerResult:
+    answer_text: str
+    citations: list[Citation]
+    model: str
+    retrieval_latency_ms: float
+    generation_latency_ms: float
+    total_latency_ms: float
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    retrieved_chunk_ids: list[int] = field(default_factory=list)
+    cache_hit: bool = False
+    cost_usd: float = 0.0
+
+
+def _split_answer_and_entries(raw_text: str) -> tuple[str, list[dict]]:
+    """Split the model's raw output into (clean answer text, citation entries).
+
+    Prefers the documented ```citations fenced format, then progressively
+    looser fallbacks -- see module docstring for provenance; these fallbacks
+    are unverified against real Gemini output.
+    """
+    match = CITATIONS_FENCED_RE.search(raw_text)
+    if match:
+        clean_text = CITATIONS_FENCED_RE.sub("", raw_text).rstrip()
+        return clean_text, _safe_json_array(match.group(1))
+
+    match = CITATIONS_UNFENCED_RE.search(raw_text)
+    if match:
+        clean_text = raw_text[: match.start()].rstrip()
+        return clean_text, _safe_json_array(match.group(1))
+
+    label_match = UNCLOSED_CITATIONS_RE.search(raw_text)
+    if label_match:
+        clean_text = raw_text[: label_match.start()].rstrip()
+        array_blob = _extract_balanced_json_array(raw_text, label_match.start())
+        if array_blob is not None:
+            return clean_text, _safe_json_array(array_blob)
+        return clean_text, []
+
+    clean_text = raw_text.rstrip()
+    bare_fence = BARE_TRAILING_FENCE_RE.search(clean_text)
+    if bare_fence:
+        return clean_text[: bare_fence.start()].rstrip(), []
+
+    return clean_text, []
+
+
+def _extract_balanced_json_array(text: str, search_from: int) -> str | None:
+    """Return the first bracket-balanced `[...]` substring in `text` at or
+    after `search_from`, or None if no "[" is found or it never closes."""
+    start = text.find("[", search_from)
+    if start == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
+
+
+def _safe_json_array(blob: str) -> list[dict]:
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _resolve_citations(entries: list[dict], chunks: list[RetrievedChunk]) -> list[Citation]:
+    by_chunk_id = {c.chunk_id: c for c in chunks}
+    citations = []
+    for entry in entries:
+        chunk = by_chunk_id.get(entry.get("chunk_id"))
+        if chunk is None:
+            continue
+        if not isinstance(entry.get("n"), int):
+            logger.warning("Dropping malformed citation entry missing a valid 'n': %r", entry)
+            continue
+        citations.append(
+            Citation(
+                n=entry.get("n"),
+                chunk_id=chunk.chunk_id,
+                text=chunk.text,
+                page_number=chunk.page_number,
+                company=chunk.company,
+                fiscal_year=chunk.fiscal_year,
+                doc_type=chunk.doc_type,
+                filename=chunk.filename,
+            )
+        )
+    return citations
+
+
+def _safe_semantic_cached(
+    query: str,
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+    model: str,
+):
+    # Embedding call + Chroma read; a network hiccup or Chroma lock here
+    # shouldn't turn what would otherwise be a normal (uncached) generation
+    # into a failed request.
+    try:
+        return get_semantic_cached(query, companies, fiscal_year, doc_type, model)
+    except Exception:
+        logger.warning("Semantic cache lookup failed; continuing without it", exc_info=True)
+        return None
+
+
+def _safe_store_cached(*args, **kwargs) -> None:
+    # Runs after a successful generation -- a failure here must not turn a
+    # good answer into an error for the caller.
+    try:
+        store_cached(*args, **kwargs)
+    except Exception:
+        logger.warning("Cache store failed; answer was still generated successfully", exc_info=True)
+
+
+def _safe_record_query_log(*args, **kwargs) -> None:
+    # Observability only -- a logging failure must never turn a successful
+    # (or already-failed, already-raised) answer flow into a second error.
+    try:
+        record_query_log(*args, **kwargs)
+    except Exception:
+        logger.warning("Query log write failed", exc_info=True)
+
+
+def _no_relevant_context_answer(
+    model: str, retrieval_latency_ms: float, total_start: float
+) -> AnswerResult:
+    return AnswerResult(
+        answer_text=NO_RELEVANT_CONTEXT_ANSWER,
+        citations=[],
+        model=model,
+        retrieval_latency_ms=retrieval_latency_ms,
+        generation_latency_ms=0.0,
+        total_latency_ms=(time.perf_counter() - total_start) * 1000,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        retrieved_chunk_ids=[],
+    )
+
+
+def _history_as_messages(history: list[HistoryTurn] | None) -> list[dict] | None:
+    if not history:
+        return None
+    return [{"role": h.role, "content": h.content} for h in history]
+
+
+def _answer_from_cache(cached, total_start: float) -> AnswerResult:
+    model = cached.model_name or settings.GEMINI_CHAT_MODEL
+    prompt_tokens = cached.prompt_tokens or 0
+    completion_tokens = cached.completion_tokens or 0
+    return AnswerResult(
+        answer_text=cached.answer_text,
+        citations=[Citation(**c) for c in cached.citations_json],
+        model=model,
+        retrieval_latency_ms=0.0,
+        generation_latency_ms=0.0,
+        total_latency_ms=(time.perf_counter() - total_start) * 1000,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=cached.total_tokens or 0,
+        retrieved_chunk_ids=cached.retrieved_chunk_ids or [],
+        cache_hit=True,
+        cost_usd=estimate_cost_usd(model, prompt_tokens, completion_tokens),
+    )
+
+
+def _retrieve_and_rerank(
+    query: str,
+    top_k: int,
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+) -> tuple[list[RetrievedChunk], float]:
+    retrieval_start = time.perf_counter()
+    candidates = retrieve_hybrid(
+        query,
+        top_k=settings.RERANK_CANDIDATE_K,
+        companies=companies,
+        fiscal_year=fiscal_year,
+        doc_type=doc_type,
+    )
+
+    distinct_companies = list(dict.fromkeys(c.company for c in candidates if c.company))
+    if len(distinct_companies) > 1:
+        # Comparison query (2+ companies present in the candidates, whether
+        # from an explicit multi-select or incidentally from an unfiltered
+        # search): rerank each company's own candidates independently and
+        # give each its own full top_k budget, rather than reranking the
+        # merged pool once with a single shared top_k. A shared cutoff lets
+        # one company's chunks dominate the budget and starves the rest down
+        # to a chunk or two each -- exactly what made early comparison
+        # answers read as "insufficient context" even when the data existed.
+        # Total context size scales with company count, mirroring how
+        # retrieve_hybrid already gives each company its own full candidate
+        # budget at the retrieval stage rather than splitting one shared
+        # budget across companies.
+        chunks = []
+        for company in distinct_companies:
+            company_candidates = [c for c in candidates if c.company == company]
+            chunks.extend(
+                c
+                for c in rerank(query, company_candidates, top_k=top_k)
+                if c.score >= settings.MIN_RERANK_SCORE
+            )
+        # Candidates with no company tag at all (company=None or "") belong
+        # to no group above and would otherwise silently vanish from a
+        # multi-company comparison, unlike the single-company path below
+        # which includes everything -- give them their own rerank budget too.
+        untagged_candidates = [c for c in candidates if not c.company]
+        if untagged_candidates:
+            chunks.extend(
+                c
+                for c in rerank(query, untagged_candidates, top_k=top_k)
+                if c.score >= settings.MIN_RERANK_SCORE
+            )
+    else:
+        chunks = [
+            c
+            for c in rerank(query, candidates, top_k=top_k)
+            if c.score >= settings.MIN_RERANK_SCORE
+        ]
+    retrieval_latency_ms = (time.perf_counter() - retrieval_start) * 1000
+    return chunks, retrieval_latency_ms
+
+
+def generate_answer(
+    query: str,
+    top_k: int = settings.DEFAULT_TOP_K,
+    companies: list[str] | None = None,
+    fiscal_year: str | None = None,
+    doc_type: str | None = None,
+    history: list[HistoryTurn] | None = None,
+    client: GeminiChatClient | None = None,
+    session_id: str | None = None,
+) -> AnswerResult:
+    """Non-streaming: cache lookup -> hybrid retrieve -> rerank -> prompt ->
+    generate -> parse citations -> cache store.
+
+    `history`, if given, is prior conversation turns included in the prompt
+    for continuity; retrieval always runs fresh off just `query`.
+    """
+    total_start = time.perf_counter()
+    chat_client = client or GeminiChatClient()
+    cache_key = make_cache_key(query, companies, fiscal_year, doc_type, chat_client.model)
+
+    log_kwargs = dict(
+        query_text=query,
+        session_id=session_id,
+        companies=companies,
+        top_k=top_k,
+        embedding_model=settings.LOCAL_EMBEDDING_MODEL,
+    )
+
+    try:
+        # A query with conversation history is inherently context-dependent
+        # ("what about last year?"), so a bare cache lookup keyed only on the
+        # literal query text would return a stale/wrong answer from a
+        # different conversation. Only cache turn-independent queries.
+        if not history:
+            cached = get_cached(cache_key) or _safe_semantic_cached(
+                query, companies, fiscal_year, doc_type, chat_client.model
+            )
+            if cached is not None:
+                answer = _answer_from_cache(cached, total_start)
+                _safe_record_query_log(
+                    result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
+                )
+                return answer
+
+        chunks, retrieval_latency_ms = _retrieve_and_rerank(
+            query, top_k, companies, fiscal_year, doc_type
+        )
+        if not chunks:
+            answer = _no_relevant_context_answer(
+                chat_client.model, retrieval_latency_ms, total_start
+            )
+            _safe_record_query_log(result=answer, cache_hit=False, **log_kwargs)
+            return answer
+
+        messages = build_messages(query, chunks, history=_history_as_messages(history))
+
+        generation_start = time.perf_counter()
+        result = chat_client.chat(messages)
+        generation_latency_ms = (time.perf_counter() - generation_start) * 1000
+        total_latency_ms = (time.perf_counter() - total_start) * 1000
+
+        clean_text, entries = _split_answer_and_entries(result.content)
+        citations = _resolve_citations(entries, chunks)
+        answer = AnswerResult(
+            answer_text=clean_text,
+            citations=citations,
+            model=result.model,
+            retrieval_latency_ms=retrieval_latency_ms,
+            generation_latency_ms=generation_latency_ms,
+            total_latency_ms=total_latency_ms,
+            prompt_tokens=result.prompt_tokens,
+            completion_tokens=result.completion_tokens,
+            total_tokens=result.total_tokens,
+            retrieved_chunk_ids=[c.chunk_id for c in chunks],
+            cost_usd=estimate_cost_usd(
+                result.model, result.prompt_tokens, result.completion_tokens
+            ),
+        )
+
+        if not history:
+            _safe_store_cached(
+                cache_key,
+                query,
+                result.model,
+                clean_text,
+                [asdict(c) for c in citations],
+                answer.retrieved_chunk_ids,
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.total_tokens,
+                companies=companies,
+                fiscal_year=fiscal_year,
+                doc_type=doc_type,
+            )
+    except Exception as e:
+        _safe_record_query_log(
+            result=None,
+            error=str(e),
+            total_latency_ms=(time.perf_counter() - total_start) * 1000,
+            **log_kwargs,
+        )
+        raise
+
+    _safe_record_query_log(result=answer, cache_hit=False, cost_usd=answer.cost_usd, **log_kwargs)
+    return answer
+
+
+def generate_answer_stream(
+    query: str,
+    top_k: int = settings.DEFAULT_TOP_K,
+    companies: list[str] | None = None,
+    fiscal_year: str | None = None,
+    doc_type: str | None = None,
+    history: list[HistoryTurn] | None = None,
+    client: GeminiChatClient | None = None,
+    session_id: str | None = None,
+) -> Iterator[str | AnswerResult]:
+    """Streaming variant: yields raw text deltas, then a final AnswerResult.
+
+    Callers should distinguish chunks by type: `str` deltas are live tokens
+    (with the trailing ```citations block, if present in a delta, still
+    included raw -- callers needing clean markdown should use the final
+    AnswerResult.answer_text instead of concatenating deltas past the fence).
+    """
+    total_start = time.perf_counter()
+    chat_client = client or GeminiChatClient()
+    cache_key = make_cache_key(query, companies, fiscal_year, doc_type, chat_client.model)
+
+    log_kwargs = dict(
+        query_text=query,
+        session_id=session_id,
+        companies=companies,
+        top_k=top_k,
+        embedding_model=settings.LOCAL_EMBEDDING_MODEL,
+    )
+
+    try:
+        if not history:
+            cached = get_cached(cache_key) or _safe_semantic_cached(
+                query, companies, fiscal_year, doc_type, chat_client.model
+            )
+            if cached is not None:
+                answer = _answer_from_cache(cached, total_start)
+                yield answer.answer_text
+                _safe_record_query_log(
+                    result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
+                )
+                yield answer
+                return
+
+        chunks, retrieval_latency_ms = _retrieve_and_rerank(
+            query, top_k, companies, fiscal_year, doc_type
+        )
+        if not chunks:
+            answer = _no_relevant_context_answer(
+                chat_client.model, retrieval_latency_ms, total_start
+            )
+            yield answer.answer_text
+            _safe_record_query_log(result=answer, cache_hit=False, **log_kwargs)
+            yield answer
+            return
+
+        messages = build_messages(query, chunks, history=_history_as_messages(history))
+
+        full_content = []
+        generation_start = time.perf_counter()
+        done: StreamDone | None = None
+        for event in chat_client.chat_stream(messages):
+            if isinstance(event, StreamToken):
+                full_content.append(event.content)
+                yield event.content
+            elif isinstance(event, StreamDone):
+                done = event
+        generation_latency_ms = (time.perf_counter() - generation_start) * 1000
+        total_latency_ms = (time.perf_counter() - total_start) * 1000
+        raw_text = "".join(full_content)
+
+        clean_text, entries = _split_answer_and_entries(raw_text)
+        citations = _resolve_citations(entries, chunks)
+        prompt_tokens = done.prompt_tokens if done else 0
+        completion_tokens = done.completion_tokens if done else 0
+        answer = AnswerResult(
+            answer_text=clean_text,
+            citations=citations,
+            model=done.model if done else chat_client.model,
+            retrieval_latency_ms=retrieval_latency_ms,
+            generation_latency_ms=generation_latency_ms,
+            total_latency_ms=total_latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=done.total_tokens if done else 0,
+            retrieved_chunk_ids=[c.chunk_id for c in chunks],
+            cost_usd=estimate_cost_usd(
+                done.model if done else chat_client.model, prompt_tokens, completion_tokens
+            ),
+        )
+
+        if not history:
+            _safe_store_cached(
+                cache_key,
+                query,
+                answer.model,
+                clean_text,
+                [asdict(c) for c in citations],
+                answer.retrieved_chunk_ids,
+                answer.prompt_tokens,
+                answer.completion_tokens,
+                answer.total_tokens,
+                companies=companies,
+                fiscal_year=fiscal_year,
+                doc_type=doc_type,
+            )
+    except Exception as e:
+        _safe_record_query_log(
+            result=None,
+            error=str(e),
+            total_latency_ms=(time.perf_counter() - total_start) * 1000,
+            **log_kwargs,
+        )
+        raise
+
+    _safe_record_query_log(result=answer, cache_hit=False, cost_usd=answer.cost_usd, **log_kwargs)
+    yield answer
