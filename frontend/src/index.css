@@ -1,0 +1,106 @@
+@import 'tailwindcss';
+
+/* Static brand tokens (identical in both themes -- these are the literal
+   values from the design brief, not swapped per-theme) plus semantic role
+   variables that ARE swapped by [data-theme="light"] below. Tailwind utility
+   classes (bg-bg, text-text, border-border, text-accent, ...) reference the
+   semantic ones, so every component using them repaints automatically when
+   the theme attribute flips -- no dark:/light: variant pairs to maintain. */
+@theme {
+  --font-display: 'Newsreader', Georgia, serif;
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+
+  --color-gold-500: #c9a227;
+  --color-gold-300: #e4c766;
+  --color-teal-500: #4fb4a8;
+  --color-brick-500: #c1554b;
+  /* Fixed dark ink for text on a solid gold fill (e.g. the primary "Ask"
+     button) -- gold reads as a mid-light tone against both themes' near-
+     black or near-white text, so this stays constant rather than swapping
+     with --text. */
+  --color-on-accent: #14181f;
+
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-border: var(--border);
+  --color-text: var(--text);
+  --color-text-muted: var(--text-muted);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-positive: var(--positive);
+  --color-negative: var(--negative);
+}
+
+:root {
+  --bg: #0b0f17;
+  --panel: #131a26;
+  --border: #1d2634;
+  --text: #edeae1;
+  --text-muted: #8b93a1;
+  --accent: var(--color-gold-500);
+  --accent-hover: var(--color-gold-300);
+  --positive: var(--color-teal-500);
+  --negative: var(--color-brick-500);
+
+  color-scheme: dark;
+}
+
+[data-theme='light'] {
+  --bg: #f7f5ef;
+  --panel: #edeae1;
+  --border: #dcd7c8;
+  --text: #14181f;
+  --text-muted: #5b6472;
+  --accent: #a47f1c;
+  --accent-hover: #8c6b16;
+  --positive: #2f8880;
+  --negative: #a63f35;
+
+  color-scheme: light;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: var(--bg);
+}
+
+/* Thin, tokenized scrollbars for the panel/list columns -- default browser
+   scrollbars break the ledger-terminal feel in a dense three-panel layout. */
+.thin-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border) transparent;
+}
+
+.thin-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.thin-scroll::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 4px;
+}
