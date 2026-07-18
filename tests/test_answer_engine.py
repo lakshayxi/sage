@@ -143,6 +143,7 @@ def test_resolve_citations_drops_entries_missing_a_valid_n():
             {"n": "not-an-int", "chunk_id": 2},  # wrong type
         ],
         chunks,
+        "Margins declined due to component costs [1] [2].",
     )
 
     assert citations == []
@@ -154,10 +155,44 @@ def test_resolve_citations_keeps_valid_entries_alongside_malformed_ones():
     citations = _resolve_citations(
         [{"n": 1, "chunk_id": 1}, {"chunk_id": 2}],
         chunks,
+        "Margins declined due to component costs [1].",
     )
 
     assert [c.n for c in citations] == [1]
     assert citations[0].chunk_id == 1
+
+
+def test_resolve_citations_drops_entry_never_referenced_in_answer_text():
+    """Regression test for the Tesla-revenue bug (eval item
+    unans-tesla-revenue): the model refused to answer but still listed a
+    resolved citation entry pointing to a real chunk -- that entry's `n`
+    never actually appeared as an inline marker in the answer text, so it
+    must be dropped."""
+    chunks = [_fake_chunk(chunk_id=1)]
+
+    citations = _resolve_citations(
+        [{"n": 1, "chunk_id": 1}],
+        chunks,
+        "The provided context does not contain information regarding Tesla's "
+        "total revenue for fiscal year 2025.",
+    )
+
+    assert citations == []
+
+
+def test_resolve_citations_keeps_entry_referenced_only_inside_multi_number_bracket():
+    """Regression test: Gemini legitimately packs multiple citation numbers
+    into one bracket like "[2, 3, 5]" -- a citation whose `n` only appears
+    that way (never as a standalone "[n]") must still be kept."""
+    chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2), _fake_chunk(chunk_id=3)]
+
+    citations = _resolve_citations(
+        [{"n": 1, "chunk_id": 1}, {"n": 4, "chunk_id": 2}, {"n": 5, "chunk_id": 3}],
+        chunks,
+        "NVIDIA faces complex and shifting export restrictions [1, 5].",
+    )
+
+    assert [c.n for c in citations] == [1, 5]
 
 
 def _fake_chat_result(content: str, model: str = "gemini-test") -> ChatResult:

@@ -25,6 +25,8 @@ from sage.generation.prompts import build_messages
 from sage.retrieval.reranker import rerank
 from sage.retrieval.retriever import RetrievedChunk, retrieve_hybrid
 
+CITATION_MARKER_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
+
 CITATIONS_FENCED_RE = re.compile(r"```citations\s*\n(.*?)```", re.DOTALL)
 # Fallback for a model that drops the backtick fence but still labels the
 # block and ends the response with a JSON array -- carried over defensively
@@ -154,8 +156,25 @@ def _safe_json_array(blob: str) -> list[dict]:
     return data if isinstance(data, list) else []
 
 
-def _resolve_citations(entries: list[dict], chunks: list[RetrievedChunk]) -> list[Citation]:
+def _referenced_citation_numbers(answer_text: str) -> set[int]:
+    """Collect every citation number appearing in any `[n]` or `[n, m, ...]`
+    inline marker in the answer text."""
+    numbers = set()
+    for match in CITATION_MARKER_RE.finditer(answer_text):
+        numbers.update(int(n) for n in match.group(1).split(","))
+    return numbers
+
+
+def _resolve_citations(
+    entries: list[dict], chunks: list[RetrievedChunk], answer_text: str
+) -> list[Citation]:
+    """Resolve the model's trailing citation entries against the retrieved
+    chunks, keeping only entries whose `n` actually appears as an inline
+    `[n]` marker in `answer_text` -- the model sometimes lists a citation
+    that it never actually referenced in the visible prose (e.g. when it
+    declines to answer), and such entries must not survive into the response."""
     by_chunk_id = {c.chunk_id: c for c in chunks}
+    referenced_numbers = _referenced_citation_numbers(answer_text)
     citations = []
     for entry in entries:
         chunk = by_chunk_id.get(entry.get("chunk_id"))
@@ -163,6 +182,8 @@ def _resolve_citations(entries: list[dict], chunks: list[RetrievedChunk]) -> lis
             continue
         if not isinstance(entry.get("n"), int):
             logger.warning("Dropping malformed citation entry missing a valid 'n': %r", entry)
+            continue
+        if entry["n"] not in referenced_numbers:
             continue
         citations.append(
             Citation(
@@ -413,7 +434,7 @@ def generate_answer(
         total_latency_ms = (time.perf_counter() - total_start) * 1000
 
         clean_text, entries = _split_answer_and_entries(result.content)
-        citations = _resolve_citations(entries, chunks)
+        citations = _resolve_citations(entries, chunks, clean_text)
         answer = AnswerResult(
             answer_text=clean_text,
             citations=citations,
@@ -529,7 +550,7 @@ def generate_answer_stream(
         raw_text = "".join(full_content)
 
         clean_text, entries = _split_answer_and_entries(raw_text)
-        citations = _resolve_citations(entries, chunks)
+        citations = _resolve_citations(entries, chunks, clean_text)
         prompt_tokens = done.prompt_tokens if done else 0
         completion_tokens = done.completion_tokens if done else 0
         answer = AnswerResult(

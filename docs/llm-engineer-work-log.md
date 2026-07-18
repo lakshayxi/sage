@@ -258,7 +258,12 @@ let at least one Apple chunk through for an unfiltered Tesla query — refusal s
 from the LLM's own judgment during generation, not from the pre-generation relevance gate, and
 that Apple chunk still got attached as a citation on an answer that explicitly says it can't
 answer. Not a hallucination risk (the visible answer text is honest), but a real UI/UX
-inconsistency worth fixing later: citations shouldn't render on a declined-to-answer response.
+inconsistency: citations shouldn't render on a declined-to-answer response. **Fixed**:
+`_resolve_citations` (`sage/generation/answer_engine.py`) now cross-checks each citation entry's
+`n` against the actual inline `[n]` markers in the answer text (parsing every number out of every
+`[...]` bracket group, so multi-number brackets like `[2, 3, 5]` still resolve correctly) and
+drops any entry that was never really referenced in the prose — live-verified this exact Tesla
+query now returns an empty `citations` array.
 `unans-amazon-netincome` (also out-of-corpus, otherwise identical shape) passed cleanly with
 zero citations, so this isn't systematic — it's specific to whatever scored that one Apple chunk
 above `MIN_RERANK_SCORE` for the Tesla query's embedding/BM25 signal.
