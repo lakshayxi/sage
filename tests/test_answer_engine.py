@@ -234,6 +234,95 @@ def test_generate_answer_filters_low_scoring_chunks_but_keeps_relevant_ones(monk
     assert result.retrieved_chunk_ids == [1]
 
 
+def test_generate_answer_retries_with_cleaned_query_when_first_attempt_is_empty(monkeypatch):
+    """When the initial rerank gate comes back empty and the query has a
+    trailing evaluative clause ("... were they good?"), the whole
+    retrieve_hybrid -> rerank -> gate sequence is retried once with that
+    clause stripped."""
+    calls = {"retrieve_hybrid": 0, "rerank": 0}
+
+    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+        calls["retrieve_hybrid"] += 1
+        return [_fake_chunk()]
+
+    def fake_rerank(query, candidates, top_k):
+        calls["rerank"] += 1
+        if calls["rerank"] == 1:
+            return [_fake_chunk(score=settings.MIN_RERANK_SCORE - 0.01)]
+        return [_fake_chunk(chunk_id=99, score=0.9)]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+
+    client = _FakeClient("Apple's FY25 financials were strong [1].")
+    result = answer_engine.generate_answer(
+        "tell me about Apple's FY25 financials, were they good?", client=client
+    )
+
+    assert calls == {"retrieve_hybrid": 2, "rerank": 2}
+    assert client.calls["chat"] == 1
+    assert result.retrieved_chunk_ids == [99]
+    assert result.answer_text != NO_RELEVANT_CONTEXT_ANSWER
+
+
+def test_generate_answer_falls_back_when_retry_with_cleaned_query_is_also_empty(monkeypatch):
+    """The retry happens exactly once -- if the cleaned query still clears
+    nothing, there's no third attempt, just the existing fallback."""
+    calls = {"retrieve_hybrid": 0, "rerank": 0}
+
+    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+        calls["retrieve_hybrid"] += 1
+        return [_fake_chunk()]
+
+    def fake_rerank(query, candidates, top_k):
+        calls["rerank"] += 1
+        return [_fake_chunk(score=settings.MIN_RERANK_SCORE - 0.01)]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        "tell me about Apple's FY25 filing's financials, were they good?", client=client
+    )
+
+    assert calls == {"retrieve_hybrid": 2, "rerank": 2}
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
+def test_generate_answer_no_retry_when_no_evaluative_clause_to_strip(monkeypatch):
+    """A query with nothing to strip must not trigger a retry -- retrieval
+    and rerank each run exactly once, same as before this fix."""
+    calls = {"retrieve_hybrid": 0, "rerank": 0}
+
+    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+        calls["retrieve_hybrid"] += 1
+        return [_fake_chunk()]
+
+    def fake_rerank(query, candidates, top_k):
+        calls["rerank"] += 1
+        return [_fake_chunk(score=settings.MIN_RERANK_SCORE - 0.01)]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        "irrelevant meta question with no evaluative clause", client=client
+    )
+
+    assert calls == {"retrieve_hybrid": 1, "rerank": 1}
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
 def test_generate_answer_uses_comparison_prompt_when_chunks_span_multiple_companies(monkeypatch):
     def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
         return [

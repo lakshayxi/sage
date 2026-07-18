@@ -41,6 +41,16 @@ NO_RELEVANT_CONTEXT_ANSWER = (
     "I don't have information in the ingested documents that's relevant to this question."
 )
 
+# A trailing evaluative clause (", were they good?", ". is that good or bad?")
+# tacked onto an otherwise on-topic question craters the cross-encoder
+# reranker's score even though the underlying question is answerable from the
+# corpus -- see CLAUDE.md for measured scores. Narrowly scoped to that
+# pattern, not a general query-rewriting system: a short trailing was/were/
+# is/are ... ? clause joined to the main clause by a period or comma.
+TRAILING_EVALUATIVE_CLAUSE_RE = re.compile(
+    r"[.,]\s*(?:was|were|is|are)\b[^?]*\?\s*\Z", re.IGNORECASE
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -247,23 +257,15 @@ def _answer_from_cache(cached, total_start: float) -> AnswerResult:
     )
 
 
-def _retrieve_and_rerank(
-    query: str,
-    top_k: int,
-    companies: list[str] | None,
-    fiscal_year: str | None,
-    doc_type: str | None,
+def _rerank_and_gate(
+    query: str, candidates: list[RetrievedChunk], top_k: int
 ) -> tuple[list[RetrievedChunk], float]:
-    retrieval_start = time.perf_counter()
-    candidates = retrieve_hybrid(
-        query,
-        top_k=settings.RERANK_CANDIDATE_K,
-        companies=companies,
-        fiscal_year=fiscal_year,
-        doc_type=doc_type,
-    )
-
+    """Rerank already-retrieved candidates and apply the MIN_RERANK_SCORE
+    gate, handling both the single-company and multi-company comparison
+    branches. Returns (surviving chunks, top reranked score seen across all
+    branches -- 0.0 if there were no candidates to rerank)."""
     distinct_companies = list(dict.fromkeys(c.company for c in candidates if c.company))
+    top_score = 0.0
     if len(distinct_companies) > 1:
         # Comparison query (2+ companies present in the candidates, whether
         # from an explicit multi-select or incidentally from an unfiltered
@@ -280,28 +282,71 @@ def _retrieve_and_rerank(
         chunks = []
         for company in distinct_companies:
             company_candidates = [c for c in candidates if c.company == company]
-            chunks.extend(
-                c
-                for c in rerank(query, company_candidates, top_k=top_k)
-                if c.score >= settings.MIN_RERANK_SCORE
-            )
+            reranked = rerank(query, company_candidates, top_k=top_k)
+            if reranked:
+                top_score = max(top_score, reranked[0].score)
+            chunks.extend(c for c in reranked if c.score >= settings.MIN_RERANK_SCORE)
         # Candidates with no company tag at all (company=None or "") belong
         # to no group above and would otherwise silently vanish from a
         # multi-company comparison, unlike the single-company path below
         # which includes everything -- give them their own rerank budget too.
         untagged_candidates = [c for c in candidates if not c.company]
         if untagged_candidates:
-            chunks.extend(
-                c
-                for c in rerank(query, untagged_candidates, top_k=top_k)
-                if c.score >= settings.MIN_RERANK_SCORE
-            )
+            reranked = rerank(query, untagged_candidates, top_k=top_k)
+            if reranked:
+                top_score = max(top_score, reranked[0].score)
+            chunks.extend(c for c in reranked if c.score >= settings.MIN_RERANK_SCORE)
     else:
-        chunks = [
-            c
-            for c in rerank(query, candidates, top_k=top_k)
-            if c.score >= settings.MIN_RERANK_SCORE
-        ]
+        reranked = rerank(query, candidates, top_k=top_k)
+        if reranked:
+            top_score = reranked[0].score
+        chunks = [c for c in reranked if c.score >= settings.MIN_RERANK_SCORE]
+    return chunks, top_score
+
+
+def _retrieve_and_rerank(
+    query: str,
+    top_k: int,
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+) -> tuple[list[RetrievedChunk], float]:
+    retrieval_start = time.perf_counter()
+    candidates = retrieve_hybrid(
+        query,
+        top_k=settings.RERANK_CANDIDATE_K,
+        companies=companies,
+        fiscal_year=fiscal_year,
+        doc_type=doc_type,
+    )
+    chunks, top_score = _rerank_and_gate(query, candidates, top_k)
+
+    if not chunks:
+        # Nothing cleared the gate -- try once more with a trailing
+        # evaluative clause stripped, in case that's what tanked the score
+        # (see TRAILING_EVALUATIVE_CLAUSE_RE). If there's nothing to strip,
+        # or the retry is also empty, this falls straight through to the
+        # existing NO_RELEVANT_CONTEXT_ANSWER behavior.
+        cleaned_query = TRAILING_EVALUATIVE_CLAUSE_RE.sub("", query).rstrip()
+        retry_top_score = None
+        if cleaned_query and cleaned_query != query:
+            retry_candidates = retrieve_hybrid(
+                cleaned_query,
+                top_k=settings.RERANK_CANDIDATE_K,
+                companies=companies,
+                fiscal_year=fiscal_year,
+                doc_type=doc_type,
+            )
+            chunks, retry_top_score = _rerank_and_gate(cleaned_query, retry_candidates, top_k)
+        logger.info(
+            "Rerank gate returned no chunks for query=%r (top_score=%.4f); "
+            "retried with cleaned_query=%r (top_score=%s)",
+            query,
+            top_score,
+            cleaned_query,
+            retry_top_score,
+        )
+
     retrieval_latency_ms = (time.perf_counter() - retrieval_start) * 1000
     return chunks, retrieval_latency_ms
 
