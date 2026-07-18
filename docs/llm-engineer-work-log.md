@@ -88,8 +88,22 @@ API or frontend layer, and a CLI as the primary proof the pipeline works end-to-
 ## Remaining limitations / TODOs
 
 - Citation-fence **fallback parsers** (dropped fence, truncated JSON — carried over from the
-  reference project's llama3.1-specific observations) are unverified against genuine Gemini
-  failure output; only the well-formed happy path was observed live.
+  reference project's llama3.1-specific observations): verified live on 2026-07-18 against 25
+  real, successful `GeminiChatClient().chat()` calls (model `gemini-flash-lite-latest`) spanning
+  single-company, genuine multi-company comparison-mode (2 distinct companies in context, real
+  `### Company` section headers), long/detailed answers, many-citation answers, malformed/vague
+  questions, and multi-turn follow-ups with conversation history. All 25 raw outputs matched
+  `CITATIONS_FENCED_RE` (the happy path) on the first try — none of the fallback regexes
+  (`CITATIONS_UNFENCED_RE`, `UNCLOSED_CITATIONS_RE`, `BARE_TRAILING_FENCE_RE`) were ever
+  exercised, and no leaked fence/JSON fragments appeared in the cleaned answer text. Gemini also
+  held up against adversarial-looking prose that could confuse a naive parser (multi-number
+  citation brackets like `[2, 3, 5]` inside bullet points, markdown headers/bold immediately
+  before the fence). Two of these real captured outputs (the comparison-mode one and the
+  long/bulleted one) are now locked in as regression fixtures in
+  `tests/test_answer_engine.py`. The fallback parsers remain defensively in place (unverified
+  Gemini *failure* output is still just absence of evidence, not evidence of absence, and the
+  parsers are cheap insurance), but the happy path is now confirmed to be what Gemini reliably
+  produces, not just what was hoped for.
 - Exact free-tier RPM/TPM/RPD numbers for Gemini *chat* are still unknown (would need the AI
   Studio dashboard) — moot for embeddings now that they're local (see update below).
 - No retrieval-quality eval harness (hand-labeled Q&A set) — out of scope for this task; the

@@ -56,6 +56,81 @@ def test_answer_with_no_citations_block_is_unaffected():
     assert entries == []
 
 
+def test_real_gemini_comparison_output_with_markdown_headers_is_parsed():
+    """Regression test using raw output actually captured from a live Gemini
+    call (gemini-flash-lite-latest, comparison-mode prompt, 2 companies in
+    context; see docs/llm-engineer-work-log.md's "Remaining limitations /
+    TODOs" for the verification session). Confirms the ```citations fenced
+    happy path still parses correctly through Gemini's real markdown-heavy
+    comparison formatting (### section headers, multiple citation numbers
+    packed into one bracket like "[2, 3]" in the prose body) -- none of that
+    should be mistaken for the trailing citations fence itself."""
+    raw = (
+        "### Apple\n"
+        "For the fiscal year ended September 27, 2025, Apple reported total net sales of "
+        "$416.161 billion [3]. The company\u2019s net income for the same period was "
+        "$112.010 billion [2, 3].\n\n"
+        "### Microsoft\n"
+        "For the fiscal year ended June 30, 2025, Microsoft reported total revenue of "
+        "$281.724 billion [6]. The company\u2019s net income for the same period was "
+        "$101.832 billion [6].\n\n"
+        "### Comparison\n"
+        "In fiscal year 2025, Apple generated higher total revenue ($416.161 billion) "
+        "compared to Microsoft ($281.724 billion). Apple also reported a higher net income "
+        "($112.010 billion) than Microsoft ($101.832 billion) for their respective fiscal "
+        "years.\n\n"
+        '```citations\n[{"n": 2, "chunk_id": 49}, {"n": 3, "chunk_id": 44}, '
+        '{"n": 6, "chunk_id": 127}]\n```'
+    )
+
+    clean_text, entries = _split_answer_and_entries(raw)
+
+    assert clean_text.startswith("### Apple")
+    assert clean_text.endswith("for their respective fiscal years.")
+    assert "```citations" not in clean_text
+    assert entries == [
+        {"n": 2, "chunk_id": 49},
+        {"n": 3, "chunk_id": 44},
+        {"n": 6, "chunk_id": 127},
+    ]
+
+
+def test_real_gemini_long_bulleted_output_with_multi_number_citations_is_parsed():
+    """Regression test using raw output actually captured from a live Gemini
+    call (gemini-flash-lite-latest): a long, multi-section answer with
+    markdown headers, bold text, and bulleted lists where several bullets
+    cite multiple chunk numbers in one bracket (e.g. "[2, 3, 5]"). Confirms
+    the fenced-citations regex still isolates just the trailing fence rather
+    than matching too early/greedily against those in-body brackets."""
+    raw = (
+        "NVIDIA\u2019s business faces a broad array of operational, geopolitical, and "
+        "regulatory risks.\n\n"
+        "### Geopolitical and Operational Risks\n"
+        "*   **Export Controls:** NVIDIA faces complex and shifting export restrictions "
+        "[2, 3, 5]. Worldwide controls create significant business uncertainty and "
+        "competitive disadvantages [2, 3, 5].\n\n"
+        "### Regulatory and Compliance Environment\n"
+        "*   **Antitrust and AI Regulation:** Regulators have initiated inquiries into "
+        "NVIDIA\u2019s business practices [2, 3].\n\n"
+        '```citations\n[{"n": 1, "chunk_id": 219}, {"n": 2, "chunk_id": 229}, '
+        '{"n": 3, "chunk_id": 228}, {"n": 4, "chunk_id": 241}, {"n": 5, "chunk_id": 197}]\n```'
+    )
+
+    clean_text, entries = _split_answer_and_entries(raw)
+
+    assert clean_text.startswith("NVIDIA\u2019s business faces")
+    assert clean_text.endswith("NVIDIA\u2019s business practices [2, 3].")
+    assert "```citations" not in clean_text
+    assert "chunk_id" not in clean_text
+    assert entries == [
+        {"n": 1, "chunk_id": 219},
+        {"n": 2, "chunk_id": 229},
+        {"n": 3, "chunk_id": 228},
+        {"n": 4, "chunk_id": 241},
+        {"n": 5, "chunk_id": 197},
+    ]
+
+
 def test_resolve_citations_drops_entries_missing_a_valid_n():
     """Regression test: a malformed LLM citation entry with no (or a
     non-integer) "n" used to flow through into Citation(n=None, ...), which
