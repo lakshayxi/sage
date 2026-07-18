@@ -17,3 +17,4 @@ data/chroma/*
 !deploy/huggingface/prebuilt/sage.db
 .env
 *.egg-info/
+eval/results/

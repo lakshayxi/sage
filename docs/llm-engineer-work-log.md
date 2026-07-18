@@ -106,8 +106,8 @@ API or frontend layer, and a CLI as the primary proof the pipeline works end-to-
   produces, not just what was hoped for.
 - Exact free-tier RPM/TPM/RPD numbers for Gemini *chat* are still unknown (would need the AI
   Studio dashboard) — moot for embeddings now that they're local (see update below).
-- No retrieval-quality eval harness (hand-labeled Q&A set) — out of scope for this task; the
-  reference project's `eval/` would be the template if one is wanted later.
+- ~~No retrieval-quality eval harness~~ — built in a later follow-up session, see "Update: eval
+  harness" below.
 - `chat_stream`'s retry only covers the call that opens the stream, not a 429 mid-stream
   (would risk duplicating already-yielded tokens) — see `sage/generation/gemini_client.py`.
 - BGE's asymmetric query-instruction prefix not implemented for local embeddings — see the
@@ -195,3 +195,74 @@ Directive: move embeddings to a local model; keep generation on Gemini (already 
   plaintext chat earlier. Correctly *not* retried (401 isn't in `_RETRYABLE_STATUS_CODES`).
   Ingestion — the actual blocker this update targeted — is fully resolved and proven live; only
   the unrelated final generation-side smoke test is blocked on a fresh key.
+
+## Update: basic eval harness (same repo, later follow-up session)
+
+**Objective:** address the "no retrieval-quality eval harness" TODO above, adapted from the
+reference project's `eval/` (hand-curated Q&A set + DeepEval/local-judge pattern) but
+reimplemented for Sage's actual architecture, not ported.
+
+**What was built:**
+- `eval/dataset.py` — 14 hand-curated questions against the real ingested corpus
+  (`Apple_FY25_filing.pdf`, `Microsoft_FY25_filing.pdf`, `NVIDIA_FY26_filing.pdf`). Every expected
+  figure was verified by reading the actual filing text via PyMuPDF (Consolidated
+  Statements of Income/segment tables), not recalled from memory or guessed. Mix: 9
+  single-company factual lookups (revenue/net income/R&D/segment), 3 multi-company
+  comparison-mode questions (`companies` with 2-3 entries, exercising
+  `retrieve_hybrid`'s round-robin merge path), 2 deliberately out-of-corpus questions (Tesla,
+  Amazon — no such filing is ingested) to check the relevance gate declines rather than
+  hallucinates.
+- `eval/scoring.py` — deterministic heuristic scorer, **not** an LLM judge. Two independent
+  checks per item: `correct` (a dollar figure within 2% tolerance of the expected value, via a
+  regex that normalizes "$416,161 million" / "$416.2 billion" / raw-dollar phrasing to a common
+  millions unit; or, for out-of-corpus items, refusal-phrase detection) and `grounded` (citation
+  filenames actually belong to the company/companies the question is about; empty for
+  out-of-corpus items). `passed = correct and grounded`. Chosen over an LLM judge (the reference
+  project's DeepEval + local-Ollama-judge pattern) because: (1) Sage has no free/unmetered local
+  judge the way Ollama was — an LLM judge here means *doubling* live Gemini calls against a
+  free-tier key already documented above (Issue 2) to have hit a hard `429` wall once; (2) this
+  dataset's answers are objectively-correct single numbers, which a heuristic checks more
+  reliably than a judge model can; (3) it avoids DeepEval's ~24-package dependency footprint for
+  a harness explicitly scoped as basic/correctness-only. See `eval/scoring.py`'s module docstring
+  for the full reasoning.
+- `eval/run_eval.py` — runs each item through the real `generate_answer()`, scores it, writes a
+  timestamped CSV + Markdown report to `eval/results/` (gitignored, like the reference project's).
+  A 1s courtesy pause between items guards against bursting the free-tier Gemini rate limit.
+- `sage-eval` console script (`pyproject.toml`: `eval*` added to `packages.find`, matching the
+  reference project's own `eval*` include) — `.venv/bin/sage-eval [--limit N]`, or
+  `.venv/bin/python -m eval.run_eval` without reinstalling.
+- `tests/test_eval_scoring.py` — 21 no-network unit tests on the pure scoring functions
+  (`extract_amounts_millions`, `numeric_match`, `keywords_match`, `refusal_detected`,
+  `allowed_filenames_for`, `score_item`), deliberately not importing `sage.generation` to stay
+  fast and import-safe. `eval/run_eval.py` itself is inherently live-network and isn't exercised
+  by `pytest tests/` (172 tests total now, unchanged pass rate, `ruff check .` /
+  `ruff format --check .` clean).
+
+**Real run results (2026-07-18, live `GEMINI_API_KEY`, model `gemini-flash-lite-latest`, real
+corpus, `.venv/bin/python -m eval.run_eval`, no `--limit`):**
+
+**13/14 passed**, 68.9s wall time, $0.00 (still under free-tier quota), 0/14 cache hits (fresh
+queries). All 9 single-company and all 3 comparison-mode questions passed on the first live run,
+including `cross-netincome-leader` (NVIDIA has the highest net income of the three despite Apple
+having the highest revenue — the model got the correct, non-obvious ranking rather than just
+naming the biggest company) and `cross-operating-income` (NVIDIA $130,387M vs. Microsoft
+$128,528M, a deliberately close ~1.4% gap used as a harder precision stress test).
+
+The one failure, `unans-tesla-revenue`, is a genuine, useful finding, not an eval-harness bug:
+asked "What was Tesla's total revenue in fiscal year 2025?" (no company filter — Tesla isn't
+ingested), the model correctly refused ("The provided context does not contain information
+regarding Tesla's total revenue for fiscal year 2025; the document provided pertains to Apple
+Inc.") — no hallucinated figure, `correct=True`. But the answer still carried a resolved citation
+to `Apple_FY25_filing.pdf`, `grounded=False`. This shows the rerank gate (`MIN_RERANK_SCORE`)
+let at least one Apple chunk through for an unfiltered Tesla query — refusal safety here came
+from the LLM's own judgment during generation, not from the pre-generation relevance gate, and
+that Apple chunk still got attached as a citation on an answer that explicitly says it can't
+answer. Not a hallucination risk (the visible answer text is honest), but a real UI/UX
+inconsistency worth fixing later: citations shouldn't render on a declined-to-answer response.
+`unans-amazon-netincome` (also out-of-corpus, otherwise identical shape) passed cleanly with
+zero citations, so this isn't systematic — it's specific to whatever scored that one Apple chunk
+above `MIN_RERANK_SCORE` for the Tesla query's embedding/BM25 signal.
+
+**How to reproduce:** `.venv/bin/sage-eval` (or `--limit N` for a faster/cheaper subset). Requires
+a live `GEMINI_API_KEY` and the corpus already ingested (`sage ingest`) — costs ~14 real Gemini
+chat calls per full run, so this is meant for occasional regression checks, not a tuning loop.
