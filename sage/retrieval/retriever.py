@@ -28,7 +28,7 @@ from rank_bm25 import BM25Okapi
 from config import settings
 from sage.db.database import get_session
 from sage.db.models import Chunk, Document
-from sage.embed.local_embedder import embed_text
+from sage.embed.local_embedder import embed_query
 from sage.retrieval import store
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -140,7 +140,7 @@ def _retrieve_hybrid_single(
     filter so the fused ranking never mixes in chunks that don't match.
     """
     where = _build_where(company, fiscal_year, doc_type)
-    query_embedding = embed_text(query_text)
+    query_embedding = embed_query(query_text)
     vector_result = store.query(query_embedding, top_k=top_k, where=where)
     vector_ids = [int(i) for i in vector_result.get("ids", [[]])[0]]
 

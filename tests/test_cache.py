@@ -7,10 +7,10 @@ from sage.generation import cache
 
 
 def _fake_embedder(vectors: dict[str, list[float]]):
-    def embed_text(text: str) -> list[float]:
+    def embed_query(text: str) -> list[float]:
         return vectors[text]
 
-    return embed_text
+    return embed_query
 
 
 def test_make_cache_key_is_deterministic():
@@ -64,7 +64,7 @@ def test_get_cached_returns_none_for_unknown_key():
 def test_store_and_get_cached_round_trip(monkeypatch):
     query_text = "round trip query"
     key = cache.make_cache_key(query_text, None, None, None, "gemini-2.5-flash")
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     citation = {
         "n": 1,
@@ -91,7 +91,7 @@ def test_store_and_get_cached_round_trip(monkeypatch):
 def test_store_cached_does_not_duplicate_an_existing_key(monkeypatch):
     query_text = "dedup query"
     key = cache.make_cache_key(query_text, None, None, None, "gemini-2.5-flash")
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     cache.store_cached(key, query_text, "gemini-2.5-flash", "first", [], [], 1, 1, 2)
     cache.store_cached(key, query_text, "gemini-2.5-flash", "second", [], [], 1, 1, 2)
@@ -193,7 +193,7 @@ def test_semantic_cache_hits_on_near_duplicate_query(monkeypatch):
     base_query = "semantic base query"
     near_query = "semantic near-duplicate query"
     monkeypatch.setattr(
-        cache, "embed_text", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
+        cache, "embed_query", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
     )
 
     key = cache.make_cache_key(base_query, None, None, None, "gemini-2.5-flash")
@@ -211,7 +211,7 @@ def test_semantic_cache_misses_below_threshold(monkeypatch):
     base_query = "semantic unrelated base"
     far_query = "semantic unrelated far"
     monkeypatch.setattr(
-        cache, "embed_text", _fake_embedder({base_query: [1.0, 0.0], far_query: [0.0, 1.0]})
+        cache, "embed_query", _fake_embedder({base_query: [1.0, 0.0], far_query: [0.0, 1.0]})
     )
 
     key = cache.make_cache_key(base_query, None, None, None, "gemini-2.5-flash")
@@ -228,7 +228,7 @@ def test_semantic_cache_respects_companies_filter(monkeypatch):
     base_query = "semantic apple query"
     near_query = "semantic microsoft query"
     monkeypatch.setattr(
-        cache, "embed_text", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
+        cache, "embed_query", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
     )
 
     key = cache.make_cache_key(base_query, ["Apple"], None, None, "gemini-2.5-flash")
@@ -257,7 +257,7 @@ def test_semantic_cache_respects_comparison_vs_single_company(monkeypatch):
     base_query = "semantic comparison base"
     near_query = "semantic comparison near"
     monkeypatch.setattr(
-        cache, "embed_text", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
+        cache, "embed_query", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
     )
 
     key = cache.make_cache_key(base_query, ["Apple", "Microsoft"], None, None, "gemini-2.5-flash")
@@ -283,7 +283,7 @@ def test_semantic_cache_treats_expired_underlying_row_as_miss(monkeypatch):
     base_query = "semantic expired base"
     near_query = "semantic expired near"
     monkeypatch.setattr(
-        cache, "embed_text", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
+        cache, "embed_query", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
     )
 
     key = cache.make_cache_key(base_query, None, None, None, "gemini-2.5-flash")

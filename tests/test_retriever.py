@@ -75,7 +75,7 @@ def _add_neutral_chunk(document_id: int) -> int:
 def test_retrieve_hybrid_resolves_chroma_ids_to_sqlite_chunks(monkeypatch, sample_chunks):
     document_id, chunk_a_id, chunk_b_id = sample_chunks
 
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
     monkeypatch.setattr(
         retriever.store,
         "query",
@@ -92,7 +92,7 @@ def test_retrieve_hybrid_resolves_chroma_ids_to_sqlite_chunks(monkeypatch, sampl
 
 
 def test_retrieve_hybrid_returns_empty_when_no_matches(monkeypatch, sample_chunks):
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
     monkeypatch.setattr(
         retriever.store,
         "query",
@@ -128,7 +128,7 @@ def test_retrieve_hybrid_recovers_bm25_only_matches(monkeypatch, sample_chunks):
     _add_neutral_chunk(document_id)
 
     # Vector search "sees" only chunk_a; chunk_b is a BM25-only match.
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
     monkeypatch.setattr(
         retriever.store,
         "query",
@@ -143,7 +143,7 @@ def test_retrieve_hybrid_recovers_bm25_only_matches(monkeypatch, sample_chunks):
 
 
 def test_retrieve_hybrid_respects_single_company_filter(monkeypatch, sample_chunks):
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
     monkeypatch.setattr(
         retriever.store,
         "query",
@@ -204,7 +204,7 @@ def test_retrieve_hybrid_multi_company_merges_balanced_across_companies(monkeypa
     msft_ids = [c.id for c in msft_chunks]
     session.close()
 
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
 
     def fake_vector_query(embedding, top_k, where=None):
         # Apple's corpus is larger (3 chunks) than Microsoft's (1) -- if a
@@ -235,7 +235,7 @@ def test_retrieve_hybrid_multi_company_collapses_to_single_when_one_company(
     monkeypatch, sample_chunks
 ):
     document_id, chunk_a_id, chunk_b_id = sample_chunks
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
     monkeypatch.setattr(
         retriever.store,
         "query",
@@ -318,7 +318,7 @@ def test_retrieve_hybrid_multi_company_gives_each_company_its_own_top_k_budget(m
     msft_ids = [c.id for c in msft_chunks]
     session.close()
 
-    monkeypatch.setattr(retriever, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(retriever, "embed_query", lambda text: [0.0] * 8)
 
     def fake_vector_query(embedding, top_k, where=None):
         # Mirrors Chroma's real behavior of honoring the company where-clause

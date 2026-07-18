@@ -151,6 +151,16 @@ Directive: move embeddings to a local model; keep generation on Gemini (already 
   side only, not on indexed passages) — would improve retrieval quality but requires
   query-embedding call sites to diverge from document-embedding call sites, which conflicts
   with keeping this a drop-in, zero-call-site-behavior-change swap. Flagged as a follow-up.
+  **Update:** implemented in a later follow-up session — `sage/embed/local_embedder.py` gained
+  `embed_query()` (prefixes then delegates to `embed_text`); `sage/retrieval/retriever.py` and
+  both query-embedding call sites in `sage/generation/cache.py` now call `embed_query` instead
+  of `embed_text`. `embed_text`/`embed_texts` are unchanged (still unprefixed) for
+  `sage/ingest/pipeline.py`'s passage embedding. Any query embeddings already sitting in a
+  dev-local `finresearch_query_cache` Chroma collection from before this change were written
+  unprefixed, so they're now slightly inconsistent with newly-prefixed query lookups — not a
+  crash, just degraded semantic-cache recall until those entries expire via
+  `CACHE_TTL_SECONDS` or the collection is rebuilt; no migration written for this local dev
+  data.
 - Tests: `tests/test_gemini_embedder.py` deleted, replaced by `tests/test_local_embedder.py` —
   fast fake-`_get_model()` tests (mirroring `tests/test_reranker.py`'s existing convention)
   plus one deliberate real-model integration test (no API key or per-call quota risk locally,

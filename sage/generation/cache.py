@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from config import settings
 from sage.db.database import get_session
 from sage.db.models import QueryCache
-from sage.embed.local_embedder import embed_text
+from sage.embed.local_embedder import embed_query
 from sage.retrieval import store
 
 # Sentinel for an unset filter field, stored/matched explicitly rather than
@@ -131,7 +131,7 @@ def get_semantic_cached(
     distance. Delegates to `get_cached` for the final lookup, so an expired
     underlying row is treated as a miss here too.
     """
-    embedding = embed_text(query_text)
+    embedding = embed_query(query_text)
     where = _semantic_where(companies, fiscal_year, doc_type, model)
     result = store.query(
         embedding, top_k=1, where=where, collection_name=settings.CHROMA_QUERY_CACHE_COLLECTION
@@ -188,7 +188,7 @@ def store_cached(
     if not inserted:
         return
 
-    embedding = embed_text(query_text)
+    embedding = embed_query(query_text)
     store.add(
         ids=[cache_key],
         embeddings=[embedding],

@@ -142,7 +142,7 @@ def test_generate_answer_runs_hybrid_retrieval_and_rerank_then_caches(monkeypatc
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("The margins declined because of component costs.")
     result = answer_engine.generate_answer("first run query", top_k=5, client=client)
@@ -166,7 +166,7 @@ def test_generate_answer_second_call_hits_cache_and_skips_pipeline(monkeypatch):
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     query = "cache round trip query"
     client = _FakeClient("Cached-worthy answer.")
@@ -199,7 +199,7 @@ def test_generate_answer_short_circuits_when_all_chunks_below_rerank_threshold(m
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("should never be called")
     result = answer_engine.generate_answer("irrelevant meta question", client=client)
@@ -225,7 +225,7 @@ def test_generate_answer_filters_low_scoring_chunks_but_keeps_relevant_ones(monk
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("Margins declined [1].")
     result = answer_engine.generate_answer("partial relevance query", client=client)
@@ -254,7 +254,7 @@ def test_generate_answer_retries_with_cleaned_query_when_first_attempt_is_empty(
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("Apple's FY25 financials were strong [1].")
     result = answer_engine.generate_answer(
@@ -283,7 +283,7 @@ def test_generate_answer_falls_back_when_retry_with_cleaned_query_is_also_empty(
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("should never be called")
     result = answer_engine.generate_answer(
@@ -311,7 +311,7 @@ def test_generate_answer_no_retry_when_no_evaluative_clause_to_strip(monkeypatch
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("should never be called")
     result = answer_engine.generate_answer(
@@ -339,7 +339,7 @@ def test_generate_answer_uses_comparison_prompt_when_chunks_span_multiple_compan
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("Apple grew capex. Microsoft grew capex more.")
     answer_engine.generate_answer(
@@ -374,7 +374,7 @@ def test_generate_answer_gives_each_company_its_own_rerank_budget(monkeypatch):
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("Comparison answer.")
     result = answer_engine.generate_answer(
@@ -406,7 +406,7 @@ def test_generate_answer_keeps_untagged_chunks_in_multi_company_comparison(monke
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("Comparison answer.")
     result = answer_engine.generate_answer(
@@ -432,7 +432,7 @@ def test_generate_answer_with_history_bypasses_cache(monkeypatch):
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     history = [HistoryTurn(role="user", content="What about last year?")]
     query = "same follow-up text"
@@ -456,7 +456,7 @@ def test_generate_answer_stream_short_circuits_when_all_chunks_below_rerank_thre
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("should never stream")
     events = list(
@@ -482,7 +482,7 @@ def test_generate_answer_stream_yields_tokens_then_final_answer(monkeypatch):
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     client = _FakeClient("Streamed answer text.")
     events = list(answer_engine.generate_answer_stream("stream query", client=client))
@@ -508,7 +508,7 @@ def test_generate_answer_raises_and_logs_error_on_generation_failure(monkeypatch
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
     monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
-    monkeypatch.setattr(cache, "embed_text", lambda text: [0.0] * 8)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
 
     query = "will fail query"
     try:

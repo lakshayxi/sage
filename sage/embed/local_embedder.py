@@ -30,17 +30,15 @@ a local, synchronous computation with no quota/429 concern at all, so the
 (it's now scoped to GeminiChatClient only, which still legitimately talks
 to a remote API).
 
-NOT implemented: BGE models are documented by BAAI to benefit from an
+Asymmetric query prefix: BGE models are documented by BAAI to benefit from an
 asymmetric "Represent this sentence for searching relevant passages: "
 instruction prefix on the *query* side only (not on indexed passages) for
-retrieval tasks -- typically a measurable recall improvement. This was
-deliberately left out to keep `embed_text`/`embed_texts` a drop-in
-replacement with the exact same call shape for every existing caller
-(ingest, retrieval, semantic cache), matching how this swap was scoped.
-Worth revisiting as a retrieval-quality follow-up: would need query-embedding
-call sites (sage/retrieval/retriever.py, sage/generation/cache.py) to route
-through a distinct query-prefixed function while document/passage embedding
-(sage/ingest/pipeline.py) stays unprefixed.
+retrieval tasks -- typically a measurable recall improvement. `embed_query`
+below applies it; `embed_text`/`embed_texts` stay unprefixed for
+document/passage embedding (sage/ingest/pipeline.py) so existing indexed
+Chroma vectors remain valid. Query-embedding call sites
+(sage/retrieval/retriever.py, sage/generation/cache.py) route through
+`embed_query` instead.
 
 Dimension note: switching embedding models changes vector dimensionality
 (this model: 384-d, vs. the earlier Gemini path's 768-d). Any existing
@@ -57,6 +55,10 @@ from config import settings
 
 _model: SentenceTransformer | None = None
 _model_lock = threading.Lock()
+
+# BGE's documented asymmetric instruction prefix -- query side only, see
+# module docstring.
+_QUERY_INSTRUCTION_PREFIX = "Represent this sentence for searching relevant passages: "
 
 
 def _get_model() -> SentenceTransformer:
@@ -82,3 +84,14 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
     model = _get_model()
     embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
     return embeddings.tolist()
+
+
+def embed_query(text: str) -> list[float]:
+    """Embed search-query text, with BGE's asymmetric instruction prefix applied.
+
+    Use for query-side embeddings only (retrieval, semantic cache
+    lookup/store) -- document/passage text must go through `embed_text`/
+    `embed_texts` instead, unprefixed, to match how indexed Chroma vectors
+    were built.
+    """
+    return embed_text(_QUERY_INSTRUCTION_PREFIX + text)

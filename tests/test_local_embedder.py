@@ -75,6 +75,24 @@ def test_embed_texts_empty_list_short_circuits_without_loading_model(monkeypatch
     assert local_embedder.embed_texts([]) == []
 
 
+def test_embed_query_prepends_the_bge_instruction_prefix(monkeypatch):
+    fake_model = FakeSentenceTransformer(dimensions=8)
+    monkeypatch.setattr(local_embedder, "_get_model", lambda: fake_model)
+
+    local_embedder.embed_query("Apple margins")
+
+    assert fake_model.calls[-1] == [
+        "Represent this sentence for searching relevant passages: Apple margins"
+    ]
+
+
+def test_embed_query_differs_from_embed_text_for_the_same_input(monkeypatch):
+    fake_model = FakeSentenceTransformer(dimensions=8)
+    monkeypatch.setattr(local_embedder, "_get_model", lambda: fake_model)
+
+    assert local_embedder.embed_query("Apple margins") != local_embedder.embed_text("Apple margins")
+
+
 def test_get_model_is_a_lazy_singleton(monkeypatch):
     load_count = {"n": 0}
 
