@@ -9,7 +9,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from api.limiter import limiter
-from api.middleware import DemoKeyMiddleware
+from api.middleware import DemoKeyMiddleware, MaxUploadBodySizeMiddleware
 from api.routes import chat, conversations, documents
 from sage.db.database import init_db
 from sage.embed.local_embedder import _get_model as _get_embedding_model
@@ -41,10 +41,20 @@ app = FastAPI(title="Sage API", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# DemoKeyMiddleware added first so CORSMiddleware (added last, and so
-# outermost -- Starlette wraps middleware in reverse add order) still attaches
-# CORS headers to a 401 it produces.
+# Added in this order (Starlette wraps middleware in *reverse* add order,
+# so CORSMiddleware -- added last -- ends up outermost, MaxUploadBodySize
+# next, DemoKey innermost, then routes):
+#   1. DemoKeyMiddleware: header check, no body access.
+#   2. MaxUploadBodySizeMiddleware: rejects an oversized /documents/upload
+#      request as bytes arrive, before Starlette's own multipart parser
+#      (which has no size cap for actual file parts) buffers the whole
+#      thing -- see api/middleware.py's docstring. Placed before DemoKey in
+#      wrapping order (i.e. checked first) so an oversized request is
+#      rejected without spending any effort on the demo-key check.
+#   3. CORSMiddleware outermost so a 401/413 either of the above produces
+#      still carries CORS headers a browser JS client can actually read.
 app.add_middleware(DemoKeyMiddleware)
+app.add_middleware(MaxUploadBodySizeMiddleware, path_prefix="/documents/upload")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

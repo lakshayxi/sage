@@ -134,11 +134,34 @@ for _dir in (RAW_DIR, PROCESSED_DIR, CHROMA_DIR, DB_DIR):
 
 # --- API ---
 # Shared demo-access key for the public deployment: unset (None) locally, so
-# api/middleware.py's DemoKeyMiddleware is a complete no-op by default.
+# api/middleware.py's DemoKeyMiddleware is a complete no-op by default. Not a
+# real secret (Vite compiles VITE_DEMO_ACCESS_KEY into the public frontend
+# bundle) -- see api/middleware.py's module docstring.
 DEMO_ACCESS_KEY = os.environ.get("DEMO_ACCESS_KEY") or None
-# Curated-demo boundary for the public deployment -- set to "false" there so
-# POST /documents/upload 403s instead of accepting arbitrary uploads.
-ALLOW_UPLOADS = os.environ.get("ALLOW_UPLOADS", "true").lower() != "false"
-# slowapi rate-limit spec string, applied to POST /chat and GET /chat/stream
-# to protect the free Gemini quota behind the public deployment.
+# Curated-demo boundary for the public deployment. Defaults to disabled --
+# uploads must be explicitly opted into with ALLOW_UPLOADS=true, not
+# explicitly opted out of, so a deployment that forgets to set this env var
+# fails closed (no arbitrary-PDF-processing service) rather than failing
+# open. Previously defaulted to enabled, which every deployment had to
+# remember to override.
+ALLOW_UPLOADS = os.environ.get("ALLOW_UPLOADS", "false").lower() == "true"
+# Hard ceiling on a single upload's size, enforced while the file streams to
+# disk (api/routes/documents.py) so an oversized upload is rejected without
+# ever buffering the whole thing in memory. Default 25MB comfortably covers
+# a real multi-hundred-page 10-K (the demo corpus's largest filing is well
+# under this) while still bounding worst-case disk/memory use per upload.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+# Hard ceiling on a single upload's page count, checked after the file is
+# confirmed to be a readable PDF but before it's handed to the (synchronous,
+# in-request) ingest pipeline -- keeps a single upload's ingestion latency
+# bounded on the public deployment, which has no background job queue.
+MAX_UPLOAD_PAGES = int(os.environ.get("MAX_UPLOAD_PAGES", "500"))
+# Hard ceiling on a single chat query's length -- rejects a pathological
+# multi-megabyte "query" string before it reaches embedding/retrieval/the
+# Gemini prompt, where it would otherwise burn real compute/quota on
+# obvious junk input.
+MAX_QUERY_LENGTH = int(os.environ.get("MAX_QUERY_LENGTH", "2000"))
+# slowapi rate-limit spec string, applied to POST /chat, POST /chat/stream,
+# and POST /documents/upload to protect the free Gemini quota (and, for
+# uploads, ingestion capacity) behind the public deployment.
 CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "10/minute")
