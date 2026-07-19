@@ -182,17 +182,89 @@ def test_resolve_citations_drops_entry_never_referenced_in_answer_text():
 
 def test_resolve_citations_keeps_entry_referenced_only_inside_multi_number_bracket():
     """Regression test: Gemini legitimately packs multiple citation numbers
-    into one bracket like "[2, 3, 5]" -- a citation whose `n` only appears
-    that way (never as a standalone "[n]") must still be kept."""
+    into one bracket like "[1, 3]" -- a citation whose `n` only appears that
+    way (never as a standalone "[n]") must still be kept."""
     chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2), _fake_chunk(chunk_id=3)]
 
     citations = _resolve_citations(
-        [{"n": 1, "chunk_id": 1}, {"n": 4, "chunk_id": 2}, {"n": 5, "chunk_id": 3}],
+        [{"n": 1, "chunk_id": 1}, {"n": 2, "chunk_id": 2}, {"n": 3, "chunk_id": 3}],
         chunks,
-        "NVIDIA faces complex and shifting export restrictions [1, 5].",
+        "NVIDIA faces complex and shifting export restrictions [1, 3].",
     )
 
-    assert [c.n for c in citations] == [1, 5]
+    assert [c.n for c in citations] == [1, 3]
+
+
+def test_resolve_citations_maps_n_positionally_and_ignores_model_chunk_id():
+    """Security regression: `n` must deterministically resolve to
+    `chunks[n - 1]` -- the chunk actually shown to the model as "[n]" in the
+    prompt (see prompts.py's build_context_block). A model-provided
+    `chunk_id` that points at a *different* retrieved chunk must never be
+    able to remap citation [1] to that other chunk."""
+    chunk_a = _fake_chunk(chunk_id=101, company="Apple")
+    chunk_b = _fake_chunk(chunk_id=202, company="Microsoft")
+    chunks = [chunk_a, chunk_b]
+
+    # The model claims citation [1] belongs to chunk_id=202 (chunk_b) -- but
+    # [1] was shown to it as chunk_a (chunk_id=101). The resolved citation
+    # must still point at chunk_a, not chunk_b.
+    citations = _resolve_citations(
+        [{"n": 1, "chunk_id": 202}],
+        chunks,
+        "Some claim about Apple [1].",
+    )
+
+    assert len(citations) == 1
+    assert citations[0].n == 1
+    assert citations[0].chunk_id == chunk_a.chunk_id
+    assert citations[0].company == "Apple"
+
+
+def test_resolve_citations_drops_zero_negative_and_out_of_range_numbers():
+    chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2)]
+
+    citations = _resolve_citations(
+        [{"n": 0, "chunk_id": 1}, {"n": -1, "chunk_id": 1}, {"n": 99, "chunk_id": 2}],
+        chunks,
+        "A claim [0] another [-1] and one more [99].",
+    )
+
+    assert citations == []
+
+
+def test_resolve_citations_drops_duplicate_numbers():
+    chunks = [_fake_chunk(chunk_id=1)]
+
+    citations = _resolve_citations(
+        [{"n": 1, "chunk_id": 1}, {"n": 1, "chunk_id": 1}],
+        chunks,
+        "Margins declined [1].",
+    )
+
+    assert len(citations) == 1
+    assert citations[0].n == 1
+
+
+def test_resolve_citations_accepts_bare_integer_entries():
+    """The model is now instructed to prefer a flat list of citation numbers
+    (`[1, 3]`) over the legacy `{"n": ..., "chunk_id": ...}` dict form -- both
+    must resolve identically."""
+    chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2), _fake_chunk(chunk_id=3)]
+
+    citations = _resolve_citations([1, 3], chunks, "Some claim [1, 3].")
+
+    assert [c.n for c in citations] == [1, 3]
+    assert [c.chunk_id for c in citations] == [chunks[0].chunk_id, chunks[2].chunk_id]
+
+
+def test_resolve_citations_rejects_bool_as_citation_number():
+    """bool is an int subclass in Python (`isinstance(True, int)` is True) --
+    a malformed `{"n": true}` entry must not silently resolve to chunks[0]."""
+    chunks = [_fake_chunk(chunk_id=1)]
+
+    citations = _resolve_citations([{"n": True, "chunk_id": 1}], chunks, "A claim [1].")
+
+    assert citations == []
 
 
 def _fake_chat_result(content: str, model: str = "gemini-test") -> ChatResult:
@@ -600,6 +672,45 @@ def test_generate_answer_stream_yields_tokens_then_final_answer(monkeypatch):
     assert events[0] == "Streamed answer text."
     assert events[-1].answer_text == "Streamed answer text."
     assert client.calls["chat_stream"] == 1
+
+
+def test_generate_answer_and_stream_resolve_mismatched_chunk_id_identically(monkeypatch):
+    """Streaming and non-streaming both funnel through the same
+    `_resolve_citations` -- a model response that tries to remap citation
+    [1] to a different chunk_id must be corrected identically on both
+    paths, not just the non-streaming one."""
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        return [_fake_chunk(chunk_id=101), _fake_chunk(chunk_id=202)]
+
+    def fake_rerank(query, candidates, top_k):
+        return candidates
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
+
+    malicious_content = (
+        'Some claim about the first chunk [1].\n```citations\n[{"n": 1, "chunk_id": 202}]\n```'
+    )
+
+    non_streaming = answer_engine.generate_answer(
+        "mismatch query one", client=_FakeClient(malicious_content)
+    )
+    stream_events = list(
+        answer_engine.generate_answer_stream(
+            "mismatch query two", client=_FakeClient(malicious_content)
+        )
+    )
+    streaming_result = stream_events[-1]
+
+    for result in (non_streaming, streaming_result):
+        assert len(result.citations) == 1
+        assert result.citations[0].n == 1
+        assert result.citations[0].chunk_id == 101  # never remapped to 202
 
 
 def test_generate_answer_raises_and_logs_error_on_generation_failure(monkeypatch):

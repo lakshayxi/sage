@@ -165,29 +165,62 @@ def _referenced_citation_numbers(answer_text: str) -> set[int]:
     return numbers
 
 
+def _entry_citation_number(entry: dict | int) -> int | None:
+    """Pull a citation number out of a model-provided entry, accepting both
+    the preferred bare-integer form (`[1, 3, 5]`) and the legacy
+    `{"n": 1, "chunk_id": ...}` dict form. Returns None for anything that
+    isn't a genuine int (including bool, which is a `int` subclass in
+    Python but never a valid citation number)."""
+    if isinstance(entry, dict):
+        entry = entry.get("n")
+    if isinstance(entry, bool) or not isinstance(entry, int):
+        return None
+    return entry
+
+
 def _resolve_citations(
     entries: list[dict], chunks: list[RetrievedChunk], answer_text: str
 ) -> list[Citation]:
-    """Resolve the model's trailing citation entries against the retrieved
-    chunks, keeping only entries whose `n` actually appears as an inline
-    `[n]` marker in `answer_text` -- the model sometimes lists a citation
-    that it never actually referenced in the visible prose (e.g. when it
-    declines to answer), and such entries must not survive into the response."""
-    by_chunk_id = {c.chunk_id: c for c in chunks}
+    """Resolve the model's trailing citation numbers against the retrieved
+    chunks.
+
+    Identity is deterministic and positional: citation number `n` always
+    means `chunks[n - 1]` -- the exact chunk the model was shown as `[n]` in
+    the prompt (see prompts.py's `build_context_block`, which labels chunks
+    `[1]`, `[2]`, ... in this same order). A `chunk_id` the model echoes back
+    in its citation JSON is never consulted to pick the chunk: trusting it
+    would let the model (accidentally or adversarially) remap citation `[1]`
+    in the visible answer text to point at a completely different retrieved
+    chunk than the one actually shown as `[1]`, which is exactly the
+    citation-integrity bug this function closes.
+
+    An entry number is dropped (not resolved) if it's malformed (missing or
+    non-int `n`), zero/negative, out of range for `chunks`, a duplicate of
+    an already-resolved number, or never actually referenced inline as an
+    `[n]`/`[n, m, ...]` marker in `answer_text` -- the model sometimes lists
+    a citation it never actually used in the visible prose (e.g. when it
+    declines to answer), and such entries must not survive into the
+    response.
+    """
     referenced_numbers = _referenced_citation_numbers(answer_text)
+    seen: set[int] = set()
     citations = []
     for entry in entries:
-        chunk = by_chunk_id.get(entry.get("chunk_id"))
-        if chunk is None:
-            continue
-        if not isinstance(entry.get("n"), int):
+        n = _entry_citation_number(entry)
+        if n is None:
             logger.warning("Dropping malformed citation entry missing a valid 'n': %r", entry)
             continue
-        if entry["n"] not in referenced_numbers:
+        if n in seen:
             continue
+        if n < 1 or n > len(chunks):
+            continue
+        if n not in referenced_numbers:
+            continue
+        seen.add(n)
+        chunk = chunks[n - 1]
         citations.append(
             Citation(
-                n=entry.get("n"),
+                n=n,
                 chunk_id=chunk.chunk_id,
                 text=chunk.text,
                 page_number=chunk.page_number,
