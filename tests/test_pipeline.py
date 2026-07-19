@@ -5,11 +5,15 @@ from sage.db.models import Chunk, Document
 from sage.ingest import pipeline
 
 
-def _make_sample_pdf(tmp_path, filename="Apple_FY24_10-K.pdf"):
+def _make_sample_pdf(tmp_path, filename="Apple_FY24_10-K.pdf", text=None):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Helvetica", size=12)
-    pdf.multi_cell(0, 10, "Apple reported FY24 results with strong revenue growth in Services.")
+    # Text includes the filename so two different-filename PDFs never
+    # collide on checksum-based dedup (sage/ingest/pipeline.py) just because
+    # this helper happens to default to the same placeholder sentence.
+    body = text or f"{filename}: reported FY24 results with strong revenue growth in Services."
+    pdf.multi_cell(0, 10, body)
     pdf_path = tmp_path / filename
     pdf.output(str(pdf_path))
     return pdf_path
@@ -110,4 +114,117 @@ def test_ingest_pdf_rolls_back_on_embedding_failure(monkeypatch, tmp_path):
 
     session = get_session()
     assert session.query(Document).count() == 0
+    session.close()
+
+
+def test_ingest_pdf_cleans_up_orphaned_chroma_vectors_on_commit_failure(monkeypatch, tmp_path):
+    """Failure-injection test: if SQLite's own commit fails *after* Chroma
+    vectors were already successfully written for this attempt, those
+    vectors must not be left behind pointing at chunk ids that no longer
+    exist anywhere in SQLite (SQLite rolls back the Document/Chunk rows on
+    any exception, but Chroma has no shared transaction to roll back with)."""
+    monkeypatch.setattr(pipeline, "embed_texts", lambda texts: [[0.1] * 8 for _ in texts])
+
+    delete_calls = []
+    real_add = pipeline.store.add
+    real_delete = pipeline.store.delete
+
+    def spying_add(*args, **kwargs):
+        real_add(*args, **kwargs)
+
+    def spying_delete(ids, collection_name=None):
+        delete_calls.append(list(ids))
+        if collection_name is not None:
+            real_delete(ids, collection_name=collection_name)
+        else:
+            real_delete(ids)
+
+    monkeypatch.setattr(pipeline.store, "add", spying_add)
+    monkeypatch.setattr(pipeline.store, "delete", spying_delete)
+
+    class ExplodingSession:
+        """Wraps a real session, but raises on commit -- simulating a
+        SQLite commit failure that happens after Chroma has already been
+        written to."""
+
+        def __init__(self, real_session):
+            self._real = real_session
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def commit(self):
+            raise RuntimeError("simulated SQLite commit failure")
+
+    real_get_session = pipeline.get_session
+    monkeypatch.setattr(pipeline, "get_session", lambda: ExplodingSession(real_get_session()))
+
+    pdf_path = _make_sample_pdf(tmp_path)
+    try:
+        pipeline.ingest_pdf(pdf_path, write_json=False)
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised
+    assert len(delete_calls) == 1
+    assert len(delete_calls[0]) > 0
+
+    session = get_session()
+    assert session.query(Document).count() == 0
+    session.close()
+
+    # The Chroma collection must not still contain the orphaned ids.
+    collection = pipeline.store.get_collection()
+    remaining = collection.get(ids=delete_calls[0])
+    assert remaining["ids"] == []
+
+
+def test_ingest_pdf_skips_duplicate_ingestion_of_identical_content(monkeypatch, tmp_path):
+    """Regression test: re-ingesting the exact same file content (e.g. a
+    retried upload) must not create a second Document/Chunk set -- the
+    existing, already-`ready` document is returned instead."""
+    embed_calls = []
+    monkeypatch.setattr(
+        pipeline,
+        "embed_texts",
+        lambda texts: embed_calls.append(texts) or [[0.1] * 8 for _ in texts],
+    )
+
+    pdf_path = _make_sample_pdf(tmp_path)
+    first = pipeline.ingest_pdf(pdf_path, write_json=False)
+    second = pipeline.ingest_pdf(pdf_path, write_json=False)
+
+    assert second.id == first.id
+    assert len(embed_calls) == 1  # no re-embedding on the deduped retry
+
+    session = get_session()
+    assert session.query(Document).count() == 1
+    assert session.query(Chunk).filter(Chunk.document_id == first.id).count() > 0
+    session.close()
+
+
+def test_ingest_pdf_retry_after_failure_does_not_duplicate_once_it_succeeds(monkeypatch, tmp_path):
+    """A failed attempt leaves no `ready` document behind (see the
+    rollback test above), so a retry of the same file must proceed as a
+    normal fresh ingest -- not silently no-op, and not create duplicates of
+    its own once it succeeds."""
+    pdf_path = _make_sample_pdf(tmp_path)
+
+    def failing_embed_texts(texts):
+        raise RuntimeError("simulated failure on first attempt")
+
+    monkeypatch.setattr(pipeline, "embed_texts", failing_embed_texts)
+    try:
+        pipeline.ingest_pdf(pdf_path, write_json=False)
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised
+
+    monkeypatch.setattr(pipeline, "embed_texts", lambda texts: [[0.1] * 8 for _ in texts])
+    document = pipeline.ingest_pdf(pdf_path, write_json=False)
+    assert document.status == "ready"
+
+    session = get_session()
+    assert session.query(Document).count() == 1
     session.close()

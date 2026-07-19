@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from config import settings
 from sage.db.conversations import HistoryTurn
 from sage.db.query_log import record_query_log
+from sage.embed.local_embedder import embed_query
 from sage.generation.cache import get_cached, get_semantic_cached, make_cache_key, store_cached
 from sage.generation.cost import estimate_cost_usd
 from sage.generation.gemini_client import GeminiChatClient, StreamDone, StreamToken
@@ -239,12 +240,13 @@ def _safe_semantic_cached(
     fiscal_year: str | None,
     doc_type: str | None,
     model: str,
+    query_embedding: list[float],
 ):
-    # Embedding call + Chroma read; a network hiccup or Chroma lock here
-    # shouldn't turn what would otherwise be a normal (uncached) generation
-    # into a failed request.
+    # Chroma read on an already-computed embedding; a network hiccup or
+    # Chroma lock here shouldn't turn what would otherwise be a normal
+    # (uncached) generation into a failed request.
     try:
-        return get_semantic_cached(query, companies, fiscal_year, doc_type, model)
+        return get_semantic_cached(query, companies, fiscal_year, doc_type, model, query_embedding)
     except Exception:
         logger.warning("Semantic cache lookup failed; continuing without it", exc_info=True)
         return None
@@ -364,7 +366,15 @@ def _retrieve_and_rerank(
     companies: list[str] | None,
     fiscal_year: str | None,
     doc_type: str | None,
+    query_embedding: list[float] | None = None,
 ) -> tuple[list[RetrievedChunk], float]:
+    """`query_embedding`, if given, is the already-computed embedding for
+    `query` (e.g. reused from a semantic cache lookup on the same text) --
+    `retrieve_hybrid` reuses it across every company in a comparison query
+    instead of re-embedding the identical text once per company. Not reused
+    for the cleaned-query retry below: that's different text, so it needs
+    its own embedding regardless.
+    """
     retrieval_start = time.perf_counter()
     candidates = retrieve_hybrid(
         query,
@@ -372,6 +382,7 @@ def _retrieve_and_rerank(
         companies=companies,
         fiscal_year=fiscal_year,
         doc_type=doc_type,
+        query_embedding=query_embedding,
     )
     chunks, top_score = _rerank_and_gate(query, candidates, top_k)
 
@@ -403,6 +414,35 @@ def _retrieve_and_rerank(
 
     retrieval_latency_ms = (time.perf_counter() - retrieval_start) * 1000
     return chunks, retrieval_latency_ms
+
+
+def _cached_or_embed(
+    query: str,
+    cache_key: str,
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+    model: str,
+    history: list[HistoryTurn] | None,
+) -> tuple[object | None, list[float] | None]:
+    """Exact-cache lookup, then (only on a miss) a semantic-cache lookup that
+    embeds `query` exactly once and reuses that vector.
+
+    Returns `(cached_row_or_None, query_embedding_or_None)`. The embedding is
+    None whenever it was never computed: a history-bearing query skips the
+    cache entirely (see `generate_answer`'s docstring), and an exact-cache
+    hit never needs one. Shared by both `generate_answer` and
+    `generate_answer_stream` so their cache/embedding behavior can't drift
+    apart from each other.
+    """
+    if history:
+        return None, None
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached, None
+    query_embedding = embed_query(query)
+    cached = _safe_semantic_cached(query, companies, fiscal_year, doc_type, model, query_embedding)
+    return cached, query_embedding
 
 
 def generate_answer(
@@ -438,19 +478,18 @@ def generate_answer(
         # ("what about last year?"), so a bare cache lookup keyed only on the
         # literal query text would return a stale/wrong answer from a
         # different conversation. Only cache turn-independent queries.
-        if not history:
-            cached = get_cached(cache_key) or _safe_semantic_cached(
-                query, companies, fiscal_year, doc_type, chat_client.model
+        cached, query_embedding = _cached_or_embed(
+            query, cache_key, companies, fiscal_year, doc_type, chat_client.model, history
+        )
+        if cached is not None:
+            answer = _answer_from_cache(cached, total_start)
+            _safe_record_query_log(
+                result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
             )
-            if cached is not None:
-                answer = _answer_from_cache(cached, total_start)
-                _safe_record_query_log(
-                    result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
-                )
-                return answer
+            return answer
 
         chunks, retrieval_latency_ms = _retrieve_and_rerank(
-            query, top_k, companies, fiscal_year, doc_type
+            query, top_k, companies, fiscal_year, doc_type, query_embedding
         )
         if not chunks:
             answer = _no_relevant_context_answer(
@@ -498,6 +537,7 @@ def generate_answer(
                 companies=companies,
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
+                query_embedding=query_embedding,
             )
     except Exception as e:
         _safe_record_query_log(
@@ -542,21 +582,20 @@ def generate_answer_stream(
     )
 
     try:
-        if not history:
-            cached = get_cached(cache_key) or _safe_semantic_cached(
-                query, companies, fiscal_year, doc_type, chat_client.model
+        cached, query_embedding = _cached_or_embed(
+            query, cache_key, companies, fiscal_year, doc_type, chat_client.model, history
+        )
+        if cached is not None:
+            answer = _answer_from_cache(cached, total_start)
+            yield answer.answer_text
+            _safe_record_query_log(
+                result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
             )
-            if cached is not None:
-                answer = _answer_from_cache(cached, total_start)
-                yield answer.answer_text
-                _safe_record_query_log(
-                    result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
-                )
-                yield answer
-                return
+            yield answer
+            return
 
         chunks, retrieval_latency_ms = _retrieve_and_rerank(
-            query, top_k, companies, fiscal_year, doc_type
+            query, top_k, companies, fiscal_year, doc_type, query_embedding
         )
         if not chunks:
             answer = _no_relevant_context_answer(
@@ -616,6 +655,7 @@ def generate_answer_stream(
                 companies=companies,
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
+                query_embedding=query_embedding,
             )
     except Exception as e:
         _safe_record_query_log(

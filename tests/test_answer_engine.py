@@ -310,7 +310,9 @@ class _FakeClient:
 def test_generate_answer_runs_hybrid_retrieval_and_rerank_then_caches(monkeypatch):
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         assert top_k == settings.RERANK_CANDIDATE_K
         return [_fake_chunk()]
@@ -338,7 +340,9 @@ def test_generate_answer_runs_hybrid_retrieval_and_rerank_then_caches(monkeypatc
 def test_generate_answer_second_call_hits_cache_and_skips_pipeline(monkeypatch):
     calls = {"retrieve_hybrid": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -372,7 +376,9 @@ def test_generate_answer_second_call_hits_cache_and_skips_pipeline(monkeypatch):
 
 
 def test_generate_answer_short_circuits_when_all_chunks_below_rerank_threshold(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -395,7 +401,9 @@ def test_generate_answer_short_circuits_when_all_chunks_below_rerank_threshold(m
 
 
 def test_generate_answer_filters_low_scoring_chunks_but_keeps_relevant_ones(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -423,7 +431,9 @@ def test_generate_answer_retries_with_cleaned_query_when_first_attempt_is_empty(
     clause stripped."""
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -454,7 +464,9 @@ def test_generate_answer_falls_back_when_retry_with_cleaned_query_is_also_empty(
     nothing, there's no third attempt, just the existing fallback."""
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -482,7 +494,9 @@ def test_generate_answer_no_retry_when_no_evaluative_clause_to_strip(monkeypatch
     and rerank each run exactly once, same as before this fix."""
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -506,7 +520,9 @@ def test_generate_answer_no_retry_when_no_evaluative_clause_to_strip(monkeypatch
 
 
 def test_generate_answer_uses_comparison_prompt_when_chunks_span_multiple_companies(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [
             _fake_chunk(chunk_id=1, company="Apple"),
             _fake_chunk(chunk_id=2, company="Microsoft"),
@@ -540,7 +556,9 @@ def test_generate_answer_gives_each_company_its_own_rerank_budget(monkeypatch):
     of up to top_k per company. Each company must keep its own full top_k
     budget, independent of how many other companies are in the mix."""
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [
             _fake_chunk(chunk_id=1, company="Apple"),
             _fake_chunk(chunk_id=2, company="Apple"),
@@ -575,7 +593,9 @@ def test_generate_answer_keeps_untagged_chunks_in_multi_company_comparison(monke
     dropped from context whenever 2+ real companies were present -- unlike
     the single-company path, which includes everything."""
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [
             _fake_chunk(chunk_id=1, company="Apple"),
             _fake_chunk(chunk_id=2, company="Microsoft"),
@@ -604,7 +624,9 @@ def test_generate_answer_with_history_bypasses_cache(monkeypatch):
     something different depending on prior turns."""
     call_count = {"retrieve": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         call_count["retrieve"] += 1
         return [_fake_chunk()]
 
@@ -629,7 +651,9 @@ def test_generate_answer_with_history_bypasses_cache(monkeypatch):
 
 
 def test_generate_answer_stream_short_circuits_when_all_chunks_below_rerank_threshold(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -655,7 +679,9 @@ def test_generate_answer_stream_short_circuits_when_all_chunks_below_rerank_thre
 
 
 def test_generate_answer_stream_yields_tokens_then_final_answer(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -713,8 +739,54 @@ def test_generate_answer_and_stream_resolve_mismatched_chunk_id_identically(monk
         assert result.citations[0].chunk_id == 101  # never remapped to 202
 
 
+def test_generate_answer_embeds_query_exactly_once_end_to_end(monkeypatch):
+    """A cache miss for an ordinary (including multi-company) query used to
+    embed the identical query text multiple times: once for the semantic
+    cache lookup, then again per company inside retrieve_hybrid. The whole
+    request must now compute the embedding exactly once and reuse it for
+    both the semantic cache check and retrieval."""
+    embed_calls = []
+
+    def counting_embed_query(text):
+        embed_calls.append(text)
+        return [0.0] * 8
+
+    monkeypatch.setattr(answer_engine, "embed_query", counting_embed_query)
+    monkeypatch.setattr(cache, "embed_query", counting_embed_query)
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        assert query_embedding == [0.0] * 8  # reused, not recomputed
+        return [
+            _fake_chunk(chunk_id=1, company="Apple"),
+            _fake_chunk(chunk_id=2, company="Microsoft"),
+            _fake_chunk(chunk_id=3, company="NVIDIA"),
+        ]
+
+    def fake_rerank(query, candidates, top_k):
+        return candidates
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    # get_semantic_cached runs for real here (a genuine miss against an
+    # empty, test-isolated Chroma collection) -- it must consume the
+    # already-computed embedding rather than calling embed_query itself.
+
+    client = _FakeClient("Comparison answer.")
+    answer_engine.generate_answer(
+        "embed-once comparison query",
+        companies=["Apple", "Microsoft", "NVIDIA"],
+        client=client,
+    )
+
+    assert embed_calls == ["embed-once comparison query"]
+
+
 def test_generate_answer_raises_and_logs_error_on_generation_failure(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
