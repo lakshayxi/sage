@@ -424,6 +424,7 @@ def _cached_or_embed(
     doc_type: str | None,
     model: str,
     history: list[HistoryTurn] | None,
+    use_cache: bool = True,
 ) -> tuple[object | None, list[float] | None]:
     """Exact-cache lookup, then (only on a miss) a semantic-cache lookup that
     embeds `query` exactly once and reuses that vector.
@@ -434,9 +435,16 @@ def _cached_or_embed(
     hit never needs one. Shared by both `generate_answer` and
     `generate_answer_stream` so their cache/embedding behavior can't drift
     apart from each other.
+
+    `use_cache=False` (e.g. the eval harness re-testing generation quality,
+    not cache plumbing) skips both cache lookups entirely -- same as a
+    history-bearing query -- but still computes and returns the embedding
+    so retrieval doesn't have to.
     """
     if history:
         return None, None
+    if not use_cache:
+        return None, embed_query(query)
     cached = get_cached(cache_key)
     if cached is not None:
         return cached, None
@@ -454,12 +462,20 @@ def generate_answer(
     history: list[HistoryTurn] | None = None,
     client: GeminiChatClient | None = None,
     session_id: str | None = None,
+    use_cache: bool = True,
 ) -> AnswerResult:
     """Non-streaming: cache lookup -> hybrid retrieve -> rerank -> prompt ->
     generate -> parse citations -> cache store.
 
     `history`, if given, is prior conversation turns included in the prompt
     for continuity; retrieval always runs fresh off just `query`.
+
+    `use_cache=False` bypasses both the read (exact + semantic) and the
+    write at the end -- for a caller re-testing generation/retrieval
+    quality itself (the eval harness, `eval/run_eval.py`) rather than
+    exercising the cache, a stale or freshly-written cache entry would
+    silently make every subsequent identical run just replay the first
+    run's answer instead of actually re-generating it.
     """
     total_start = time.perf_counter()
     chat_client = client or GeminiChatClient()
@@ -479,7 +495,14 @@ def generate_answer(
         # literal query text would return a stale/wrong answer from a
         # different conversation. Only cache turn-independent queries.
         cached, query_embedding = _cached_or_embed(
-            query, cache_key, companies, fiscal_year, doc_type, chat_client.model, history
+            query,
+            cache_key,
+            companies,
+            fiscal_year,
+            doc_type,
+            chat_client.model,
+            history,
+            use_cache,
         )
         if cached is not None:
             answer = _answer_from_cache(cached, total_start)
@@ -523,7 +546,7 @@ def generate_answer(
             ),
         )
 
-        if not history:
+        if not history and use_cache:
             _safe_store_cached(
                 cache_key,
                 query,

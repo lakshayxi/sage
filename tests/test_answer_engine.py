@@ -739,6 +739,46 @@ def test_generate_answer_and_stream_resolve_mismatched_chunk_id_identically(monk
         assert result.citations[0].chunk_id == 101  # never remapped to 202
 
 
+def test_generate_answer_use_cache_false_bypasses_read_and_write(monkeypatch):
+    """use_cache=False (the eval harness's mode, eval/run_eval.py) must
+    never serve a cached answer and must never write one -- otherwise a
+    harness meant to re-test generation quality would silently just replay
+    whatever the first run produced."""
+    calls = {"retrieve_hybrid": 0, "chat": 0}
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        calls["retrieve_hybrid"] += 1
+        return [_fake_chunk()]
+
+    def fake_rerank(query, candidates, top_k):
+        return [_fake_chunk()]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
+
+    query = "use-cache-false query"
+    client = _FakeClient("First answer.")
+    first = answer_engine.generate_answer(query, client=client, use_cache=False)
+    assert first.cache_hit is False
+    assert calls["retrieve_hybrid"] == 1
+
+    # A second call with the same query and a different answer must NOT
+    # come back as a cache hit -- if the first call had written to the
+    # cache, this would incorrectly return "First answer." again.
+    client2 = _FakeClient("Second, different answer.")
+    second = answer_engine.generate_answer(query, client=client2, use_cache=False)
+    assert second.cache_hit is False
+    assert second.answer_text == "Second, different answer."
+    assert calls["retrieve_hybrid"] == 2  # retrieval ran fresh both times
+
+    assert (
+        cache.get_cached(cache.make_cache_key(query, None, None, None, client.model)) is None
+    )  # nothing was ever written
+
+
 def test_generate_answer_embeds_query_exactly_once_end_to_end(monkeypatch):
     """A cache miss for an ordinary (including multi-company) query used to
     embed the identical query text multiple times: once for the semantic

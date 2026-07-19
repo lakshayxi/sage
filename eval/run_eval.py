@@ -11,10 +11,32 @@ numeric answers a heuristic checks more reliably than a judge model would,
 and it avoids a heavy eval-framework dependency for a harness explicitly
 scoped as basic/correctness-only).
 
+Every run passes `use_cache=False` to `generate_answer` -- without it, a
+second run against the same dataset would silently replay whatever the
+*first* run generated (via the exact-match/semantic query cache) instead of
+actually re-testing generation, making this harness useless for catching a
+same-day prompt/retrieval regression. This does mean every run spends full
+retrieval + generation cost/latency on every item, every time, by design.
+
+Beyond the original correct/grounded scoring, each item also reports:
+- **recall@k**: whether hybrid retrieval (before reranking/gating) surfaced
+  at least one chunk from the question's expected source document at all --
+  isolates retrieval quality from reranking/generation quality.
+- **gate_passed**: whether the cross-encoder relevance gate
+  (`settings.MIN_RERANK_SCORE`) let anything through to the LLM at all.
+- **citation_mapping_valid**: whether every resolved citation's `n`
+  deterministically points at the right retrieved chunk
+  (`retrieved_chunk_ids[n - 1]`) -- an end-to-end live check of the
+  citation-integrity fix in `sage/generation/answer_engine.py`.
+- **text_supported**: whether the *text* of the cited chunk(s), not just
+  their filename, actually contains/supports the expected value (see
+  `eval/scoring.py`'s `citation_text_supports_expected`).
+
 Requires a live `GEMINI_API_KEY` (`.env` at the repo root) -- there is no
 stub/offline mode, unlike `pytest tests/`. Every item costs one real Gemini
-chat call (plus a local embedding + rerank pass, $0). At 14 items this is a
-small, deliberate spend against a free-tier key already documented
+chat call (plus a local embedding + rerank pass, $0, and one extra local
+retrieval-only call for recall@k, also $0). At ~18 items this is a small,
+deliberate spend against a free-tier key already documented
 (`docs/llm-engineer-work-log.md`) to have a hard, non-recoverable quota
 wall on *embeddings* (now local, so moot) -- chat quota headroom is less
 well characterized, so this harness is meant to be run occasionally to spot
@@ -36,9 +58,11 @@ from pathlib import Path
 
 from config import settings
 from eval.dataset import EVAL_ITEMS, EvalItem
-from eval.scoring import score_item
+from eval.scoring import allowed_filenames_for, score_item
+from sage.db.conversations import HistoryTurn
 from sage.db.database import init_db
 from sage.generation.answer_engine import generate_answer
+from sage.retrieval.retriever import retrieve_hybrid
 
 RESULTS_DIR = settings.BASE_DIR / "eval" / "results"
 
@@ -48,23 +72,69 @@ RESULTS_DIR = settings.BASE_DIR / "eval" / "results"
 _PAUSE_BETWEEN_ITEMS_SECONDS = 1.0
 
 
+def _item_history(item: EvalItem) -> list[HistoryTurn] | None:
+    if not item.history:
+        return None
+    return [HistoryTurn(role=h["role"], content=h["content"]) for h in item.history]
+
+
+def _recall_at_k(item: EvalItem) -> bool | None:
+    """Whether hybrid retrieval alone (before reranking/gating) surfaced at
+    least one chunk from the question's expected source document, at the
+    same candidate width (`RERANK_CANDIDATE_K`) `generate_answer` uses
+    internally. None (not applicable) for a deliberately unanswerable item
+    -- there's no "expected source" to recall."""
+    if not item.answerable:
+        return None
+    allowed = allowed_filenames_for(item)
+    candidates = retrieve_hybrid(
+        item.question,
+        top_k=settings.RERANK_CANDIDATE_K,
+        companies=item.companies,
+        fiscal_year=item.fiscal_year,
+        doc_type=item.doc_type,
+    )
+    return any(c.filename in allowed for c in candidates)
+
+
+def _citation_mapping_valid(retrieved_chunk_ids: list[int], citations) -> bool:
+    """Live, end-to-end check of the citation-integrity fix: every resolved
+    citation's `n` must deterministically resolve to
+    `retrieved_chunk_ids[n - 1]` -- the exact chunk shown to the model as
+    "[n]" -- with nothing out of range or mismatched."""
+    for c in citations:
+        if not (1 <= c.n <= len(retrieved_chunk_ids)):
+            return False
+        if retrieved_chunk_ids[c.n - 1] != c.chunk_id:
+            return False
+    return True
+
+
 def _run_item(item: EvalItem) -> dict:
+    recall = _recall_at_k(item)
+
     start = time.perf_counter()
     result = generate_answer(
         item.question,
         companies=item.companies,
         fiscal_year=item.fiscal_year,
         doc_type=item.doc_type,
+        history=_item_history(item),
+        use_cache=False,
     )
     latency_ms = (time.perf_counter() - start) * 1000
 
     citation_filenames = [c.filename for c in result.citations]
-    score = score_item(item, result.answer_text, citation_filenames)
+    citation_texts = [c.text for c in result.citations]
+    score = score_item(item, result.answer_text, citation_filenames, citation_texts)
+    gate_passed = len(result.retrieved_chunk_ids) > 0
+    citation_mapping_valid = _citation_mapping_valid(result.retrieved_chunk_ids, result.citations)
 
     return {
         "id": item.id,
         "question": item.question,
         "answerable": item.answerable,
+        "multi_turn": item.history is not None,
         "expected_answer": item.expected_answer,
         "answer": result.answer_text,
         "citation_filenames": ";".join(citation_filenames),
@@ -72,8 +142,12 @@ def _run_item(item: EvalItem) -> dict:
         "cache_hit": result.cache_hit,
         "cost_usd": round(result.cost_usd, 6),
         "latency_ms": round(latency_ms, 1),
+        "recall_at_k": recall,
+        "gate_passed": gate_passed,
+        "citation_mapping_valid": citation_mapping_valid,
         "correct": score.correct,
         "grounded": score.grounded,
+        "text_supported": score.text_supported,
         "passed": score.passed,
         "detail": score.detail,
     }
@@ -88,6 +162,15 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+def _rate(rows: list[dict], key: str) -> str:
+    """`n/d passed` string over rows where `key` isn't None (N/A)."""
+    applicable = [r for r in rows if r[key] is not None]
+    if not applicable:
+        return "n/a"
+    passed = sum(1 for r in applicable if r[key])
+    return f"{passed}/{len(applicable)}"
+
+
 def _write_markdown(path: Path, rows: list[dict], total_elapsed_s: float) -> None:
     passed = sum(1 for r in rows if r["passed"])
     total_cost = sum(r["cost_usd"] for r in rows)
@@ -99,18 +182,28 @@ def _write_markdown(path: Path, rows: list[dict], total_elapsed_s: float) -> Non
         f"Items evaluated: {len(rows)} (of {len(EVAL_ITEMS)} in the full dataset)",
         f"Pass rate: {passed}/{len(rows)}",
         f"Total wall time: {total_elapsed_s:.1f}s",
-        f"Cache hits: {cache_hits}/{len(rows)}",
+        f"Cache hits: {cache_hits}/{len(rows)} (expected 0 -- use_cache=False every run)",
         f"Total estimated cost: ${total_cost:.6f}",
+        "",
+        "## Aggregate retrieval/citation metrics",
+        "",
+        f"- recall@k (answerable items only): {_rate(rows, 'recall_at_k')}",
+        f"- rerank gate passed: {_rate(rows, 'gate_passed')}",
+        f"- citation number->chunk mapping valid: {_rate(rows, 'citation_mapping_valid')}",
+        f"- citation text supports expected value: {_rate(rows, 'text_supported')}",
         "",
         "## Per-item results",
         "",
-        "| id | answerable | passed | correct | grounded | latency_ms | cache_hit |",
-        "|---|---|---|---|---|---|---|",
+        "| id | answerable | multi_turn | passed | correct | grounded | text_supported | "
+        "recall_at_k | gate_passed | citation_mapping_valid | latency_ms |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
-            f"| {r['id']} | {r['answerable']} | {r['passed']} | {r['correct']} | "
-            f"{r['grounded']} | {r['latency_ms']} | {r['cache_hit']} |"
+            f"| {r['id']} | {r['answerable']} | {r['multi_turn']} | {r['passed']} | "
+            f"{r['correct']} | {r['grounded']} | {r['text_supported']} | "
+            f"{r['recall_at_k']} | {r['gate_passed']} | {r['citation_mapping_valid']} | "
+            f"{r['latency_ms']} |"
         )
     lines.append("")
     lines.append("## Failure detail")
@@ -150,7 +243,11 @@ def main() -> None:
         row = _run_item(item)
         rows.append(row)
         status = "PASS" if row["passed"] else "FAIL"
-        print(f"    {status}  correct={row['correct']} grounded={row['grounded']}")
+        print(
+            f"    {status}  correct={row['correct']} grounded={row['grounded']} "
+            f"text_supported={row['text_supported']} recall_at_k={row['recall_at_k']} "
+            f"citation_mapping_valid={row['citation_mapping_valid']}"
+        )
         if i < len(items):
             time.sleep(_PAUSE_BETWEEN_ITEMS_SECONDS)
     total_elapsed_s = time.perf_counter() - start

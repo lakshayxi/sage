@@ -5,6 +5,7 @@ live-network tool and isn't exercised by this file or by `pytest tests/`)."""
 from eval.dataset import EvalItem
 from eval.scoring import (
     allowed_filenames_for,
+    citation_text_supports_expected,
     extract_amounts_millions,
     keywords_match,
     numeric_match,
@@ -143,6 +144,85 @@ def test_score_item_unanswerable_fails_if_it_fabricates_an_answer():
     result = score_item(item, "Tesla's revenue was $100,000 million.", ["Apple_FY25_filing.pdf"])
     assert not result.correct
     assert not result.grounded
+    assert not result.passed
+
+
+def test_citation_text_supports_expected_true_when_figure_present():
+    item = EvalItem(id="apple-revenue", question="q", expected_amount_millions=416_161.0)
+    assert citation_text_supports_expected(
+        item, ["Total net sales were $416,161 million for fiscal 2025."]
+    )
+
+
+def test_citation_text_supports_expected_false_when_figure_absent():
+    """Regression test: a citation pointing at an allowed-filename chunk
+    that doesn't actually contain the expected figure (e.g. the model cited
+    an irrelevant page of the right filing) must not be treated as
+    supporting the answer just because the filename check passed."""
+    item = EvalItem(id="apple-revenue", question="q", expected_amount_millions=416_161.0)
+    assert not citation_text_supports_expected(
+        item, ["Apple Inc. is headquartered in Cupertino, California."]
+    )
+
+
+def test_citation_text_supports_expected_true_for_raw_financial_table_text():
+    """Regression test found via a live run against the real corpus: a
+    cited chunk that's raw 10-K financial-statement-table text (scale
+    stated once in a caption, e.g. "(In millions...)", not spelled out
+    next to every number the way generated prose does) used to be scored
+    as NOT supporting an expected figure it actually states, because
+    numeric_match's raw-dollar-figure heuristic (built for prose) divided
+    the bare "$ 416,161" by another 1,000,000. This is the exact chunk text
+    from a real live citation against the ingested Apple 10-K."""
+    item = EvalItem(id="apple-revenue", question="q", expected_amount_millions=416_161.0)
+    assert citation_text_supports_expected(
+        item,
+        [
+            "Total net sales $ 416,161 $ 391,035 $ 383,285\n\n"
+            "Portion of total net sales that was included in deferred "
+            "revenue as of the beginning of the period $ 8,229 $ 7,728 $ 8,169"
+        ],
+    )
+
+
+def test_citation_text_supports_expected_false_with_no_citation_texts():
+    item = EvalItem(id="apple-revenue", question="q", expected_amount_millions=416_161.0)
+    assert not citation_text_supports_expected(item, [])
+
+
+def test_citation_text_supports_expected_checks_keywords_too():
+    item = EvalItem(id="nvda-segment", question="q", expected_keywords=["Compute"])
+    assert citation_text_supports_expected(item, ["Compute & Networking revenue grew."])
+    assert not citation_text_supports_expected(item, ["Graphics revenue grew."])
+
+
+def test_citation_text_supports_expected_true_for_unanswerable_item():
+    item = EvalItem(id="unans", question="q", answerable=False)
+    assert citation_text_supports_expected(item, [])
+
+
+def test_score_item_text_supported_defaults_true_when_not_checked():
+    """Callers that don't pass citation_texts (e.g. existing tests above,
+    or any caller predating this check) must see unchanged behavior."""
+    item = EvalItem(id="apple-revenue", question="q", expected_amount_millions=416_161.0)
+    result = score_item(item, "Apple's net sales were $416,161 million.", ["Apple_FY25_filing.pdf"])
+    assert result.text_supported is True
+    assert result.passed
+
+
+def test_score_item_fails_when_citation_text_does_not_support_answer():
+    """Regression test: filename-only grounding used to pass even when the
+    cited chunk's actual text has nothing to do with the expected figure."""
+    item = EvalItem(id="apple-revenue", question="q", expected_amount_millions=416_161.0)
+    result = score_item(
+        item,
+        "Apple's net sales were $416,161 million.",
+        ["Apple_FY25_filing.pdf"],
+        citation_texts=["Apple Inc. designs, manufactures, and markets smartphones."],
+    )
+    assert result.correct
+    assert result.grounded
+    assert not result.text_supported
     assert not result.passed
 
 
