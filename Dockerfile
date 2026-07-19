@@ -33,8 +33,7 @@ RUN npm run build
 # "bookworm" pinned explicitly, not plain "slim": chromadb requires
 # sqlite3>=3.35, and older Debian bases have shipped sqlite3 older than that,
 # which fails at import time with "unsupported version of sqlite3". Mirrors
-# the same pin in the sibling reference project's Dockerfile
-# (/Users/shay/Desktop/projects/edge/Dockerfile).
+# the same pin in the sibling reference project's Dockerfile.
 FROM python:3.11-slim-bookworm
 
 # HF Spaces containers run as uid 1000 -- create that exact user and set its
@@ -54,7 +53,14 @@ COPY --chown=appuser api ./api
 COPY --chown=appuser config ./config
 COPY --chown=appuser --from=frontend-build /frontend/dist ./frontend/dist
 
+# sentence-transformers pulls in torch as a transitive dependency; resolving
+# it from plain PyPI gets the default CUDA-enabled build, which drags in
+# several hundred MB of unused nvidia-* wheels on this CPU-only HF Space.
+# Preinstalling the pinned CPU wheel from PyTorch's own CPU index first means
+# pip already sees torch satisfied when it later resolves Sage's deps, and
+# never swaps it for the CUDA build.
 RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir torch==2.13.0+cpu --index-url https://download.pytorch.org/whl/cpu \
     && pip install --no-cache-dir -e .
 
 # data/{raw,processed,chroma} and db/ are where the app writes/reads at
