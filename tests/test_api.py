@@ -593,6 +593,44 @@ def test_demo_key_middleware_allows_matching_header(monkeypatch, client):
     assert response.status_code == 200
 
 
+# --- startup: empty demo corpus should be surfaced, not silently served ---
+
+
+def test_startup_warns_when_no_documents_ingested(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        with TestClient(app):
+            pass
+
+    assert any("no documents are ingested" in record.message for record in caplog.records)
+
+
+def test_startup_does_not_warn_when_documents_exist(monkeypatch, caplog):
+    import logging
+
+    from sage.db.database import get_session
+    from sage.db.models import Document
+
+    session = get_session()
+    session.add(
+        Document(
+            filename="Apple_FY25_filing.pdf",
+            source_path="/tmp/Apple_FY25_filing.pdf",
+            page_count=1,
+            status="ready",
+        )
+    )
+    session.commit()
+    session.close()
+
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        with TestClient(app):
+            pass
+
+    assert not any("no documents are ingested" in record.message for record in caplog.records)
+
+
 # --- routing: wrong-method requests should 405, not fall through to the
 # frontend static mount and 404 ---
 

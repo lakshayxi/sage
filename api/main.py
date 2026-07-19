@@ -1,5 +1,6 @@
 """FastAPI app: CORS, rate limiting, demo-key middleware, and route registration."""
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,9 +12,12 @@ from slowapi.errors import RateLimitExceeded
 from api.limiter import limiter
 from api.middleware import DemoKeyMiddleware, MaxUploadBodySizeMiddleware
 from api.routes import chat, conversations, documents
-from sage.db.database import init_db
+from sage.db.database import get_session, init_db
+from sage.db.models import Document
 from sage.embed.local_embedder import _get_model as _get_embedding_model
 from sage.retrieval.reranker import _get_model as _get_reranker_model
+
+logger = logging.getLogger(__name__)
 
 # Built frontend assets (frontend/dist, produced by `npm run build` -- see
 # the root Dockerfile's frontend-build stage). Not present in local dev
@@ -24,9 +28,40 @@ from sage.retrieval.reranker import _get_model as _get_reranker_model
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
+def _warn_if_corpus_empty() -> None:
+    """Log a loud warning at startup if no documents are ingested yet.
+
+    Doesn't fail startup -- an empty corpus is completely normal for a fresh
+    local dev environment before the first `sage ingest`. But the Hugging
+    Face demo image (see Dockerfile / deploy/huggingface/prebuilt/README.md)
+    is meant to ship with a pre-ingested corpus baked in; if that image ever
+    gets built with the still-placeholder `sage.db`/`chroma/` (see that
+    README's "Current status"), every query would silently fall through the
+    relevance gate with no answer, for a reason that isn't obvious. This
+    check surfaces that specific misconfiguration in the deployment's boot
+    logs instead of only being discoverable by trying a query by hand.
+    """
+    session = get_session()
+    try:
+        document_count = session.query(Document).count()
+    finally:
+        session.close()
+
+    if document_count == 0:
+        logger.warning(
+            "Startup check: no documents are ingested (db/sage.db has zero Document "
+            "rows). Every query will hit the relevance gate and refuse to answer "
+            "until at least one document is ingested (`sage ingest` or "
+            "POST /documents/upload). If this is the Hugging Face demo image, this "
+            "means it was built with the placeholder corpus -- see "
+            "deploy/huggingface/prebuilt/README.md."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _warn_if_corpus_empty()
     # Load both lazy-singleton models once at startup, off the request path
     # entirely -- otherwise the first requests after a cold start race to
     # build them (see each module's _get_model() locking) and cold-start
