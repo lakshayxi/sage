@@ -182,17 +182,89 @@ def test_resolve_citations_drops_entry_never_referenced_in_answer_text():
 
 def test_resolve_citations_keeps_entry_referenced_only_inside_multi_number_bracket():
     """Regression test: Gemini legitimately packs multiple citation numbers
-    into one bracket like "[2, 3, 5]" -- a citation whose `n` only appears
-    that way (never as a standalone "[n]") must still be kept."""
+    into one bracket like "[1, 3]" -- a citation whose `n` only appears that
+    way (never as a standalone "[n]") must still be kept."""
     chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2), _fake_chunk(chunk_id=3)]
 
     citations = _resolve_citations(
-        [{"n": 1, "chunk_id": 1}, {"n": 4, "chunk_id": 2}, {"n": 5, "chunk_id": 3}],
+        [{"n": 1, "chunk_id": 1}, {"n": 2, "chunk_id": 2}, {"n": 3, "chunk_id": 3}],
         chunks,
-        "NVIDIA faces complex and shifting export restrictions [1, 5].",
+        "NVIDIA faces complex and shifting export restrictions [1, 3].",
     )
 
-    assert [c.n for c in citations] == [1, 5]
+    assert [c.n for c in citations] == [1, 3]
+
+
+def test_resolve_citations_maps_n_positionally_and_ignores_model_chunk_id():
+    """Security regression: `n` must deterministically resolve to
+    `chunks[n - 1]` -- the chunk actually shown to the model as "[n]" in the
+    prompt (see prompts.py's build_context_block). A model-provided
+    `chunk_id` that points at a *different* retrieved chunk must never be
+    able to remap citation [1] to that other chunk."""
+    chunk_a = _fake_chunk(chunk_id=101, company="Apple")
+    chunk_b = _fake_chunk(chunk_id=202, company="Microsoft")
+    chunks = [chunk_a, chunk_b]
+
+    # The model claims citation [1] belongs to chunk_id=202 (chunk_b) -- but
+    # [1] was shown to it as chunk_a (chunk_id=101). The resolved citation
+    # must still point at chunk_a, not chunk_b.
+    citations = _resolve_citations(
+        [{"n": 1, "chunk_id": 202}],
+        chunks,
+        "Some claim about Apple [1].",
+    )
+
+    assert len(citations) == 1
+    assert citations[0].n == 1
+    assert citations[0].chunk_id == chunk_a.chunk_id
+    assert citations[0].company == "Apple"
+
+
+def test_resolve_citations_drops_zero_negative_and_out_of_range_numbers():
+    chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2)]
+
+    citations = _resolve_citations(
+        [{"n": 0, "chunk_id": 1}, {"n": -1, "chunk_id": 1}, {"n": 99, "chunk_id": 2}],
+        chunks,
+        "A claim [0] another [-1] and one more [99].",
+    )
+
+    assert citations == []
+
+
+def test_resolve_citations_drops_duplicate_numbers():
+    chunks = [_fake_chunk(chunk_id=1)]
+
+    citations = _resolve_citations(
+        [{"n": 1, "chunk_id": 1}, {"n": 1, "chunk_id": 1}],
+        chunks,
+        "Margins declined [1].",
+    )
+
+    assert len(citations) == 1
+    assert citations[0].n == 1
+
+
+def test_resolve_citations_accepts_bare_integer_entries():
+    """The model is now instructed to prefer a flat list of citation numbers
+    (`[1, 3]`) over the legacy `{"n": ..., "chunk_id": ...}` dict form -- both
+    must resolve identically."""
+    chunks = [_fake_chunk(chunk_id=1), _fake_chunk(chunk_id=2), _fake_chunk(chunk_id=3)]
+
+    citations = _resolve_citations([1, 3], chunks, "Some claim [1, 3].")
+
+    assert [c.n for c in citations] == [1, 3]
+    assert [c.chunk_id for c in citations] == [chunks[0].chunk_id, chunks[2].chunk_id]
+
+
+def test_resolve_citations_rejects_bool_as_citation_number():
+    """bool is an int subclass in Python (`isinstance(True, int)` is True) --
+    a malformed `{"n": true}` entry must not silently resolve to chunks[0]."""
+    chunks = [_fake_chunk(chunk_id=1)]
+
+    citations = _resolve_citations([{"n": True, "chunk_id": 1}], chunks, "A claim [1].")
+
+    assert citations == []
 
 
 def _fake_chat_result(content: str, model: str = "gemini-test") -> ChatResult:
@@ -238,7 +310,9 @@ class _FakeClient:
 def test_generate_answer_runs_hybrid_retrieval_and_rerank_then_caches(monkeypatch):
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         assert top_k == settings.RERANK_CANDIDATE_K
         return [_fake_chunk()]
@@ -266,7 +340,9 @@ def test_generate_answer_runs_hybrid_retrieval_and_rerank_then_caches(monkeypatc
 def test_generate_answer_second_call_hits_cache_and_skips_pipeline(monkeypatch):
     calls = {"retrieve_hybrid": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -300,7 +376,9 @@ def test_generate_answer_second_call_hits_cache_and_skips_pipeline(monkeypatch):
 
 
 def test_generate_answer_short_circuits_when_all_chunks_below_rerank_threshold(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -323,7 +401,9 @@ def test_generate_answer_short_circuits_when_all_chunks_below_rerank_threshold(m
 
 
 def test_generate_answer_filters_low_scoring_chunks_but_keeps_relevant_ones(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -351,7 +431,9 @@ def test_generate_answer_retries_with_cleaned_query_when_first_attempt_is_empty(
     clause stripped."""
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -382,7 +464,9 @@ def test_generate_answer_falls_back_when_retry_with_cleaned_query_is_also_empty(
     nothing, there's no third attempt, just the existing fallback."""
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -410,7 +494,9 @@ def test_generate_answer_no_retry_when_no_evaluative_clause_to_strip(monkeypatch
     and rerank each run exactly once, same as before this fix."""
     calls = {"retrieve_hybrid": 0, "rerank": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         calls["retrieve_hybrid"] += 1
         return [_fake_chunk()]
 
@@ -434,7 +520,9 @@ def test_generate_answer_no_retry_when_no_evaluative_clause_to_strip(monkeypatch
 
 
 def test_generate_answer_uses_comparison_prompt_when_chunks_span_multiple_companies(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [
             _fake_chunk(chunk_id=1, company="Apple"),
             _fake_chunk(chunk_id=2, company="Microsoft"),
@@ -468,7 +556,9 @@ def test_generate_answer_gives_each_company_its_own_rerank_budget(monkeypatch):
     of up to top_k per company. Each company must keep its own full top_k
     budget, independent of how many other companies are in the mix."""
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [
             _fake_chunk(chunk_id=1, company="Apple"),
             _fake_chunk(chunk_id=2, company="Apple"),
@@ -503,7 +593,9 @@ def test_generate_answer_keeps_untagged_chunks_in_multi_company_comparison(monke
     dropped from context whenever 2+ real companies were present -- unlike
     the single-company path, which includes everything."""
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [
             _fake_chunk(chunk_id=1, company="Apple"),
             _fake_chunk(chunk_id=2, company="Microsoft"),
@@ -532,7 +624,9 @@ def test_generate_answer_with_history_bypasses_cache(monkeypatch):
     something different depending on prior turns."""
     call_count = {"retrieve": 0}
 
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         call_count["retrieve"] += 1
         return [_fake_chunk()]
 
@@ -557,7 +651,9 @@ def test_generate_answer_with_history_bypasses_cache(monkeypatch):
 
 
 def test_generate_answer_stream_short_circuits_when_all_chunks_below_rerank_threshold(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -583,7 +679,9 @@ def test_generate_answer_stream_short_circuits_when_all_chunks_below_rerank_thre
 
 
 def test_generate_answer_stream_yields_tokens_then_final_answer(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):
@@ -602,8 +700,133 @@ def test_generate_answer_stream_yields_tokens_then_final_answer(monkeypatch):
     assert client.calls["chat_stream"] == 1
 
 
+def test_generate_answer_and_stream_resolve_mismatched_chunk_id_identically(monkeypatch):
+    """Streaming and non-streaming both funnel through the same
+    `_resolve_citations` -- a model response that tries to remap citation
+    [1] to a different chunk_id must be corrected identically on both
+    paths, not just the non-streaming one."""
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        return [_fake_chunk(chunk_id=101), _fake_chunk(chunk_id=202)]
+
+    def fake_rerank(query, candidates, top_k):
+        return candidates
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
+
+    malicious_content = (
+        'Some claim about the first chunk [1].\n```citations\n[{"n": 1, "chunk_id": 202}]\n```'
+    )
+
+    non_streaming = answer_engine.generate_answer(
+        "mismatch query one", client=_FakeClient(malicious_content)
+    )
+    stream_events = list(
+        answer_engine.generate_answer_stream(
+            "mismatch query two", client=_FakeClient(malicious_content)
+        )
+    )
+    streaming_result = stream_events[-1]
+
+    for result in (non_streaming, streaming_result):
+        assert len(result.citations) == 1
+        assert result.citations[0].n == 1
+        assert result.citations[0].chunk_id == 101  # never remapped to 202
+
+
+def test_generate_answer_use_cache_false_bypasses_read_and_write(monkeypatch):
+    """use_cache=False (the eval harness's mode, eval/run_eval.py) must
+    never serve a cached answer and must never write one -- otherwise a
+    harness meant to re-test generation quality would silently just replay
+    whatever the first run produced."""
+    calls = {"retrieve_hybrid": 0, "chat": 0}
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        calls["retrieve_hybrid"] += 1
+        return [_fake_chunk()]
+
+    def fake_rerank(query, candidates, top_k):
+        return [_fake_chunk()]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
+
+    query = "use-cache-false query"
+    client = _FakeClient("First answer.")
+    first = answer_engine.generate_answer(query, client=client, use_cache=False)
+    assert first.cache_hit is False
+    assert calls["retrieve_hybrid"] == 1
+
+    # A second call with the same query and a different answer must NOT
+    # come back as a cache hit -- if the first call had written to the
+    # cache, this would incorrectly return "First answer." again.
+    client2 = _FakeClient("Second, different answer.")
+    second = answer_engine.generate_answer(query, client=client2, use_cache=False)
+    assert second.cache_hit is False
+    assert second.answer_text == "Second, different answer."
+    assert calls["retrieve_hybrid"] == 2  # retrieval ran fresh both times
+
+    assert (
+        cache.get_cached(cache.make_cache_key(query, None, None, None, client.model)) is None
+    )  # nothing was ever written
+
+
+def test_generate_answer_embeds_query_exactly_once_end_to_end(monkeypatch):
+    """A cache miss for an ordinary (including multi-company) query used to
+    embed the identical query text multiple times: once for the semantic
+    cache lookup, then again per company inside retrieve_hybrid. The whole
+    request must now compute the embedding exactly once and reuse it for
+    both the semantic cache check and retrieval."""
+    embed_calls = []
+
+    def counting_embed_query(text):
+        embed_calls.append(text)
+        return [0.0] * 8
+
+    monkeypatch.setattr(answer_engine, "embed_query", counting_embed_query)
+    monkeypatch.setattr(cache, "embed_query", counting_embed_query)
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        assert query_embedding == [0.0] * 8  # reused, not recomputed
+        return [
+            _fake_chunk(chunk_id=1, company="Apple"),
+            _fake_chunk(chunk_id=2, company="Microsoft"),
+            _fake_chunk(chunk_id=3, company="NVIDIA"),
+        ]
+
+    def fake_rerank(query, candidates, top_k):
+        return candidates
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    # get_semantic_cached runs for real here (a genuine miss against an
+    # empty, test-isolated Chroma collection) -- it must consume the
+    # already-computed embedding rather than calling embed_query itself.
+
+    client = _FakeClient("Comparison answer.")
+    answer_engine.generate_answer(
+        "embed-once comparison query",
+        companies=["Apple", "Microsoft", "NVIDIA"],
+        client=client,
+    )
+
+    assert embed_calls == ["embed-once comparison query"]
+
+
 def test_generate_answer_raises_and_logs_error_on_generation_failure(monkeypatch):
-    def fake_retrieve_hybrid(query, top_k, companies=None, fiscal_year=None, doc_type=None):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
         return [_fake_chunk()]
 
     def fake_rerank(query, candidates, top_k):

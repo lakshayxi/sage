@@ -61,6 +61,13 @@ class EvalItem:
     # `companies` (via COMPANY_FILENAMES), or "any of the three ingested
     # filings" if `companies` is also None (cross-company/unfiltered).
     allowed_filenames: list[str] | None = None
+    # Prior conversation turns, as {"role": "user"|"assistant", "content":
+    # str} dicts -- exercises generate_answer's history-bearing path
+    # (retrieval runs fresh off `question` alone; the LLM sees the full
+    # history for continuity). None for the common single-shot case. A
+    # history-bearing item is never cache-checked by generate_answer itself
+    # regardless of run_eval.py's use_cache flag (see answer_engine.py).
+    history: list[dict] | None = None
 
 
 EVAL_ITEMS: list[EvalItem] = [
@@ -200,5 +207,92 @@ EVAL_ITEMS: list[EvalItem] = [
         question="What was Amazon's net income in fiscal year 2025?",
         answerable=False,
         expected_answer="Not answerable -- no Amazon filing is ingested (only Apple/MSFT/NVIDIA).",
+    ),
+    # --- Unanswerable with a semantically similar distractor in-corpus:
+    # unlike the Tesla/Amazon items above (no plausible distractor at all,
+    # since neither company is ingested), these ask about a real ingested
+    # company but a fact/period the corpus doesn't actually contain --
+    # close enough to real content that hybrid retrieval is likely to
+    # surface genuinely similar-looking chunks, making refusal a harder,
+    # more meaningful test than an entirely out-of-corpus question. ---
+    EvalItem(
+        id="unans-apple-fy2020-revenue",
+        question="What was Apple's total net sales in fiscal year 2020?",
+        companies=["Apple"],
+        answerable=False,
+        expected_answer=(
+            "Not answerable -- only Apple's FY25 filing is ingested; FY2020 figures "
+            "aren't in the corpus, even though FY25 revenue (a distractor) is."
+        ),
+    ),
+    EvalItem(
+        id="unans-nvidia-automotive-segment",
+        question=("How much revenue did NVIDIA's Automotive segment generate in fiscal year 2026?"),
+        companies=["NVIDIA"],
+        answerable=False,
+        expected_answer=(
+            "Not answerable as asked -- the ingested NVIDIA FY26 filing reports "
+            "Compute & Networking and Graphics as its two segments, not a separate "
+            "'Automotive' segment; a plausible-sounding but fabricated figure here "
+            "would indicate the model pattern-matched to real segment-revenue "
+            "chunks instead of checking whether this specific segment exists."
+        ),
+    ),
+    # --- Multi-turn follow-ups: exercise generate_answer's history-bearing
+    # path (retrieval runs fresh off the follow-up question alone; the LLM
+    # sees prior turns for continuity). Not covered by any single-shot item
+    # above. ---
+    EvalItem(
+        id="multiturn-apple-followup-netincome",
+        # Deliberately not "And what was its net income in the same
+        # period?" -- a purely pronoun-referenced follow-up carries no
+        # standalone semantic content for the cross-encoder reranker to
+        # score (it never sees conversation history, only this query
+        # text), so it fails MIN_RERANK_SCORE's relevance gate before ever
+        # reaching generation -- confirmed via a live run. Restating "net
+        # income" and the fiscal year keeps this a real follow-up (still
+        # needs history to know *whose* net income "its" refers to for a
+        # correctly-scoped, continuity-aware answer) while giving the gate
+        # enough to work with.
+        question="What was its net income in fiscal year 2025?",
+        companies=["Apple"],
+        fiscal_year="FY25",
+        expected_answer="$112,010 million.",
+        expected_amount_millions=112_010.0,
+        history=[
+            {"role": "user", "content": "What was Apple's total net sales in fiscal year 2025?"},
+            {
+                "role": "assistant",
+                "content": "Apple's total net sales in fiscal year 2025 were $416,161 million [1].",
+            },
+        ],
+    ),
+    EvalItem(
+        id="multiturn-cross-company-followup",
+        # See multiturn-apple-followup-netincome's comment -- "those two"
+        # alone gives the reranker nothing to score; naming both companies
+        # keeps this answerable via retrieval while "compared to the prior
+        # question" still requires history for the model to know which
+        # figure ("net income", not "operating income") is actually new.
+        question="Between Microsoft and NVIDIA, which had the higher net income?",
+        companies=["Microsoft", "NVIDIA"],
+        expected_answer=("NVIDIA ($120,067M) had higher net income than Microsoft ($101,832M)."),
+        expected_keywords=["NVIDIA"],
+        history=[
+            {
+                "role": "user",
+                "content": (
+                    "Between Microsoft and NVIDIA, which had higher operating income in "
+                    "its most recent fiscal year filing?"
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": (
+                    "NVIDIA reported higher operating income ($130,387M) than Microsoft "
+                    "($128,528M) [1, 2]."
+                ),
+            },
+        ],
     ),
 ]

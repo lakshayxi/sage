@@ -20,9 +20,9 @@ In the Space's **Settings → Variables and secrets**, set:
 
 | Name | Type | Required | Notes |
 |---|---|---|---|
-| `GEMINI_API_KEY` | Secret | Yes | Sage is Gemini-only (chat + embeddings) — nothing works without this. |
+| `GEMINI_API_KEY` | Secret | Yes | Generation is Gemini-only — nothing answers without this. (Embeddings run locally, not via Gemini.) |
 | `DEMO_ACCESS_KEY` | Secret | Recommended | Gates `/chat`, `/conversations`, `/documents` behind an `X-Demo-Key` header (`api/middleware.py`). Leave unset only if the demo is meant to be fully open. |
-| `ALLOW_UPLOADS` | Variable | Yes — set to `false` | Curated-demo boundary: `POST /documents/upload` 403s instead of accepting arbitrary PDFs from the public internet. Defaults to `true` if unset — **must** be explicitly set on this deployment. |
+| `ALLOW_UPLOADS` | Variable | No — leave unset | Curated-demo boundary: `POST /documents/upload` 403s instead of accepting arbitrary PDFs from the public internet. Defaults to `false` (disabled) if unset, which is exactly what this deployment wants — only set it to `true` if this Space is deliberately meant to accept public uploads. |
 | `CHAT_RATE_LIMIT` | Variable | Optional | slowapi rate-limit spec (default `10/minute`) applied to `/chat` and `/chat/stream`, protecting the shared Gemini quota behind a public URL. |
 
 These map directly to `config/settings.py`'s `os.environ.get(...)` calls — no
@@ -38,11 +38,17 @@ Space's Settings UI.
 
 If `DEMO_ACCESS_KEY` is set, the frontend must be built with a matching
 `VITE_DEMO_ACCESS_KEY` so it can actually supply the key back — as an
-`X-Demo-Key` header from `conversations.ts`/`documents.ts`, and as a `key`
-query param from `chat.ts`'s `GET /chat/stream` call, since the browser's
-native `EventSource` can't set custom headers at all (see
-`api/middleware.py` and `frontend/src/api/chat.ts`). Without this, setting
+`X-Demo-Key` header on every request to `/chat`, `/chat/stream`,
+`/conversations`, and `/documents` (see `api/middleware.py` and
+`frontend/src/api/session.ts`'s `demoKeyHeaders()`). Without this, setting
 only `DEMO_ACCESS_KEY` locks the deployed frontend out of its own API.
+
+Note that `VITE_DEMO_ACCESS_KEY` is not a real secret once it's built into
+the frontend — Vite inlines it into the public JS bundle, so anyone can
+read it out of the deployed site's own source (see
+`api/middleware.py`'s module docstring). It's a casual-access deterrent,
+not an auth boundary; treat the deployment as effectively public and rely
+on `CHAT_RATE_LIMIT` for abuse protection regardless of whether this is set.
 
 Vite inlines `VITE_*` vars into the built JS at build time, not runtime, so
 this can't be set as a Space Secret/Variable the way `DEMO_ACCESS_KEY`

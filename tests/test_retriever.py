@@ -277,6 +277,61 @@ def test_merge_balanced_interleaves_and_keeps_every_candidate():
     assert [c.chunk_id for c in merged] == [1, 10, 2, 3]
 
 
+def test_retrieve_hybrid_embeds_query_exactly_once_for_multi_company(monkeypatch):
+    """Regression test: retrieve_hybrid used to re-embed the identical query
+    text once per company in a multi-company comparison (a 3-company query
+    meant 3 redundant embedding calls for the same text). It must embed
+    once and reuse that vector across every company's retrieval call."""
+    session = get_session()
+    apple = _make_document(session, "Apple")
+    msft = _make_document(session, "Microsoft")
+    nvda = _make_document(session, "NVIDIA")
+    for doc in (apple, msft, nvda):
+        session.add(
+            Chunk(
+                document_id=doc.id,
+                chunk_index=0,
+                page_number=1,
+                text=f"{doc.company} capex discussion.",
+                char_start=0,
+                char_end=10,
+                token_count=5,
+            )
+        )
+    session.commit()
+    session.close()
+
+    embed_calls = []
+    monkeypatch.setattr(
+        retriever, "embed_query", lambda text: embed_calls.append(text) or [0.0] * 8
+    )
+    monkeypatch.setattr(
+        retriever.store,
+        "query",
+        lambda embedding, top_k, where=None: {"ids": [[]], "distances": [[]]},
+    )
+
+    retriever.retrieve_hybrid("capex", top_k=2, companies=["Apple", "Microsoft", "NVIDIA"])
+
+    assert len(embed_calls) == 1
+
+
+def test_retrieve_hybrid_reuses_a_passed_in_embedding_without_recomputing(monkeypatch):
+    embed_calls = []
+    monkeypatch.setattr(
+        retriever, "embed_query", lambda text: embed_calls.append(text) or [9.9] * 8
+    )
+    monkeypatch.setattr(
+        retriever.store,
+        "query",
+        lambda embedding, top_k, where=None: {"ids": [[]], "distances": [[]]},
+    )
+
+    retriever.retrieve_hybrid("capex", top_k=2, query_embedding=[0.0] * 8)
+
+    assert embed_calls == []  # embed_query never called -- the given vector was reused
+
+
 def test_retrieve_hybrid_multi_company_gives_each_company_its_own_top_k_budget(monkeypatch):
     """Regression test: retrieve_hybrid's multi-company branch used to cap
     the merged pool to one shared top_k, so a company with more candidates

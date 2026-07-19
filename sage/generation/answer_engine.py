@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from config import settings
 from sage.db.conversations import HistoryTurn
 from sage.db.query_log import record_query_log
+from sage.embed.local_embedder import embed_query
 from sage.generation.cache import get_cached, get_semantic_cached, make_cache_key, store_cached
 from sage.generation.cost import estimate_cost_usd
 from sage.generation.gemini_client import GeminiChatClient, StreamDone, StreamToken
@@ -165,29 +166,62 @@ def _referenced_citation_numbers(answer_text: str) -> set[int]:
     return numbers
 
 
+def _entry_citation_number(entry: dict | int) -> int | None:
+    """Pull a citation number out of a model-provided entry, accepting both
+    the preferred bare-integer form (`[1, 3, 5]`) and the legacy
+    `{"n": 1, "chunk_id": ...}` dict form. Returns None for anything that
+    isn't a genuine int (including bool, which is a `int` subclass in
+    Python but never a valid citation number)."""
+    if isinstance(entry, dict):
+        entry = entry.get("n")
+    if isinstance(entry, bool) or not isinstance(entry, int):
+        return None
+    return entry
+
+
 def _resolve_citations(
     entries: list[dict], chunks: list[RetrievedChunk], answer_text: str
 ) -> list[Citation]:
-    """Resolve the model's trailing citation entries against the retrieved
-    chunks, keeping only entries whose `n` actually appears as an inline
-    `[n]` marker in `answer_text` -- the model sometimes lists a citation
-    that it never actually referenced in the visible prose (e.g. when it
-    declines to answer), and such entries must not survive into the response."""
-    by_chunk_id = {c.chunk_id: c for c in chunks}
+    """Resolve the model's trailing citation numbers against the retrieved
+    chunks.
+
+    Identity is deterministic and positional: citation number `n` always
+    means `chunks[n - 1]` -- the exact chunk the model was shown as `[n]` in
+    the prompt (see prompts.py's `build_context_block`, which labels chunks
+    `[1]`, `[2]`, ... in this same order). A `chunk_id` the model echoes back
+    in its citation JSON is never consulted to pick the chunk: trusting it
+    would let the model (accidentally or adversarially) remap citation `[1]`
+    in the visible answer text to point at a completely different retrieved
+    chunk than the one actually shown as `[1]`, which is exactly the
+    citation-integrity bug this function closes.
+
+    An entry number is dropped (not resolved) if it's malformed (missing or
+    non-int `n`), zero/negative, out of range for `chunks`, a duplicate of
+    an already-resolved number, or never actually referenced inline as an
+    `[n]`/`[n, m, ...]` marker in `answer_text` -- the model sometimes lists
+    a citation it never actually used in the visible prose (e.g. when it
+    declines to answer), and such entries must not survive into the
+    response.
+    """
     referenced_numbers = _referenced_citation_numbers(answer_text)
+    seen: set[int] = set()
     citations = []
     for entry in entries:
-        chunk = by_chunk_id.get(entry.get("chunk_id"))
-        if chunk is None:
-            continue
-        if not isinstance(entry.get("n"), int):
+        n = _entry_citation_number(entry)
+        if n is None:
             logger.warning("Dropping malformed citation entry missing a valid 'n': %r", entry)
             continue
-        if entry["n"] not in referenced_numbers:
+        if n in seen:
             continue
+        if n < 1 or n > len(chunks):
+            continue
+        if n not in referenced_numbers:
+            continue
+        seen.add(n)
+        chunk = chunks[n - 1]
         citations.append(
             Citation(
-                n=entry.get("n"),
+                n=n,
                 chunk_id=chunk.chunk_id,
                 text=chunk.text,
                 page_number=chunk.page_number,
@@ -206,12 +240,13 @@ def _safe_semantic_cached(
     fiscal_year: str | None,
     doc_type: str | None,
     model: str,
+    query_embedding: list[float],
 ):
-    # Embedding call + Chroma read; a network hiccup or Chroma lock here
-    # shouldn't turn what would otherwise be a normal (uncached) generation
-    # into a failed request.
+    # Chroma read on an already-computed embedding; a network hiccup or
+    # Chroma lock here shouldn't turn what would otherwise be a normal
+    # (uncached) generation into a failed request.
     try:
-        return get_semantic_cached(query, companies, fiscal_year, doc_type, model)
+        return get_semantic_cached(query, companies, fiscal_year, doc_type, model, query_embedding)
     except Exception:
         logger.warning("Semantic cache lookup failed; continuing without it", exc_info=True)
         return None
@@ -331,7 +366,15 @@ def _retrieve_and_rerank(
     companies: list[str] | None,
     fiscal_year: str | None,
     doc_type: str | None,
+    query_embedding: list[float] | None = None,
 ) -> tuple[list[RetrievedChunk], float]:
+    """`query_embedding`, if given, is the already-computed embedding for
+    `query` (e.g. reused from a semantic cache lookup on the same text) --
+    `retrieve_hybrid` reuses it across every company in a comparison query
+    instead of re-embedding the identical text once per company. Not reused
+    for the cleaned-query retry below: that's different text, so it needs
+    its own embedding regardless.
+    """
     retrieval_start = time.perf_counter()
     candidates = retrieve_hybrid(
         query,
@@ -339,6 +382,7 @@ def _retrieve_and_rerank(
         companies=companies,
         fiscal_year=fiscal_year,
         doc_type=doc_type,
+        query_embedding=query_embedding,
     )
     chunks, top_score = _rerank_and_gate(query, candidates, top_k)
 
@@ -372,6 +416,43 @@ def _retrieve_and_rerank(
     return chunks, retrieval_latency_ms
 
 
+def _cached_or_embed(
+    query: str,
+    cache_key: str,
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+    model: str,
+    history: list[HistoryTurn] | None,
+    use_cache: bool = True,
+) -> tuple[object | None, list[float] | None]:
+    """Exact-cache lookup, then (only on a miss) a semantic-cache lookup that
+    embeds `query` exactly once and reuses that vector.
+
+    Returns `(cached_row_or_None, query_embedding_or_None)`. The embedding is
+    None whenever it was never computed: a history-bearing query skips the
+    cache entirely (see `generate_answer`'s docstring), and an exact-cache
+    hit never needs one. Shared by both `generate_answer` and
+    `generate_answer_stream` so their cache/embedding behavior can't drift
+    apart from each other.
+
+    `use_cache=False` (e.g. the eval harness re-testing generation quality,
+    not cache plumbing) skips both cache lookups entirely -- same as a
+    history-bearing query -- but still computes and returns the embedding
+    so retrieval doesn't have to.
+    """
+    if history:
+        return None, None
+    if not use_cache:
+        return None, embed_query(query)
+    cached = get_cached(cache_key)
+    if cached is not None:
+        return cached, None
+    query_embedding = embed_query(query)
+    cached = _safe_semantic_cached(query, companies, fiscal_year, doc_type, model, query_embedding)
+    return cached, query_embedding
+
+
 def generate_answer(
     query: str,
     top_k: int = settings.DEFAULT_TOP_K,
@@ -381,12 +462,20 @@ def generate_answer(
     history: list[HistoryTurn] | None = None,
     client: GeminiChatClient | None = None,
     session_id: str | None = None,
+    use_cache: bool = True,
 ) -> AnswerResult:
     """Non-streaming: cache lookup -> hybrid retrieve -> rerank -> prompt ->
     generate -> parse citations -> cache store.
 
     `history`, if given, is prior conversation turns included in the prompt
     for continuity; retrieval always runs fresh off just `query`.
+
+    `use_cache=False` bypasses both the read (exact + semantic) and the
+    write at the end -- for a caller re-testing generation/retrieval
+    quality itself (the eval harness, `eval/run_eval.py`) rather than
+    exercising the cache, a stale or freshly-written cache entry would
+    silently make every subsequent identical run just replay the first
+    run's answer instead of actually re-generating it.
     """
     total_start = time.perf_counter()
     chat_client = client or GeminiChatClient()
@@ -405,19 +494,25 @@ def generate_answer(
         # ("what about last year?"), so a bare cache lookup keyed only on the
         # literal query text would return a stale/wrong answer from a
         # different conversation. Only cache turn-independent queries.
-        if not history:
-            cached = get_cached(cache_key) or _safe_semantic_cached(
-                query, companies, fiscal_year, doc_type, chat_client.model
+        cached, query_embedding = _cached_or_embed(
+            query,
+            cache_key,
+            companies,
+            fiscal_year,
+            doc_type,
+            chat_client.model,
+            history,
+            use_cache,
+        )
+        if cached is not None:
+            answer = _answer_from_cache(cached, total_start)
+            _safe_record_query_log(
+                result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
             )
-            if cached is not None:
-                answer = _answer_from_cache(cached, total_start)
-                _safe_record_query_log(
-                    result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
-                )
-                return answer
+            return answer
 
         chunks, retrieval_latency_ms = _retrieve_and_rerank(
-            query, top_k, companies, fiscal_year, doc_type
+            query, top_k, companies, fiscal_year, doc_type, query_embedding
         )
         if not chunks:
             answer = _no_relevant_context_answer(
@@ -451,7 +546,7 @@ def generate_answer(
             ),
         )
 
-        if not history:
+        if not history and use_cache:
             _safe_store_cached(
                 cache_key,
                 query,
@@ -465,6 +560,7 @@ def generate_answer(
                 companies=companies,
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
+                query_embedding=query_embedding,
             )
     except Exception as e:
         _safe_record_query_log(
@@ -509,21 +605,20 @@ def generate_answer_stream(
     )
 
     try:
-        if not history:
-            cached = get_cached(cache_key) or _safe_semantic_cached(
-                query, companies, fiscal_year, doc_type, chat_client.model
+        cached, query_embedding = _cached_or_embed(
+            query, cache_key, companies, fiscal_year, doc_type, chat_client.model, history
+        )
+        if cached is not None:
+            answer = _answer_from_cache(cached, total_start)
+            yield answer.answer_text
+            _safe_record_query_log(
+                result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
             )
-            if cached is not None:
-                answer = _answer_from_cache(cached, total_start)
-                yield answer.answer_text
-                _safe_record_query_log(
-                    result=answer, cache_hit=True, cost_usd=answer.cost_usd, **log_kwargs
-                )
-                yield answer
-                return
+            yield answer
+            return
 
         chunks, retrieval_latency_ms = _retrieve_and_rerank(
-            query, top_k, companies, fiscal_year, doc_type
+            query, top_k, companies, fiscal_year, doc_type, query_embedding
         )
         if not chunks:
             answer = _no_relevant_context_answer(
@@ -583,6 +678,7 @@ def generate_answer_stream(
                 companies=companies,
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
+                query_embedding=query_embedding,
             )
     except Exception as e:
         _safe_record_query_log(

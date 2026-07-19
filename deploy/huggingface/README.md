@@ -33,3 +33,13 @@ anyone trying it.
 
 See `deploy/huggingface/DEPLOY.md` in the source repo for how this Space is
 built and deployed.
+
+<!--
+Deployer checklist before this file goes live as the Space's actual README:
+the "pre-loaded" claim above is only true once the real corpus has replaced
+the placeholder in deploy/huggingface/prebuilt/ (see that directory's
+README's "Current status") and the image has been rebuilt from it. The
+running app itself also checks this at startup and logs a warning if
+db/sage.db still has zero ingested documents (api/main.py) -- check the
+Space's Logs tab after first deploy to confirm the warning is absent.
+-->

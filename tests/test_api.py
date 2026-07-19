@@ -129,7 +129,7 @@ def test_chat_stream_emits_deltas_then_done_event(monkeypatch, client):
 
     monkeypatch.setattr(chat_routes, "generate_answer_stream", fake_generate_answer_stream)
 
-    with client.stream("GET", "/chat/stream", params={"query": "Why did margins decline?"}) as r:
+    with client.stream("POST", "/chat/stream", json={"query": "Why did margins decline?"}) as r:
         assert r.status_code == 200
         body = "".join(r.iter_text())
 
@@ -150,7 +150,7 @@ def test_chat_stream_strips_citations_fence_from_live_deltas(monkeypatch, client
 
     monkeypatch.setattr(chat_routes, "generate_answer_stream", fake_generate_answer_stream)
 
-    with client.stream("GET", "/chat/stream", params={"query": "q"}) as r:
+    with client.stream("POST", "/chat/stream", json={"query": "q"}) as r:
         body = "".join(r.iter_text())
 
     delta_lines = [
@@ -161,6 +161,59 @@ def test_chat_stream_strips_citations_fence_from_live_deltas(monkeypatch, client
     )
     assert "```citations" not in streamed_text
     assert "chunk_id" not in streamed_text
+
+
+def test_chat_stream_get_is_no_longer_supported(client):
+    """Regression test: GET /chat/stream used to carry the query, session
+    token, and (via DemoKeyMiddleware) the demo access key as URL query
+    params -- all leaking into server access logs, browser history, and any
+    Referer header. Streaming is POST-only now (frontend/src/api/chat.ts
+    drives it with fetch(), not EventSource), so a GET must not be routed
+    to it at all."""
+    response = client.get("/chat/stream", params={"query": "q"})
+    assert response.status_code == 405
+
+
+def test_chat_stream_session_token_travels_as_header_not_query_param(monkeypatch, client):
+    conversation_id, token = conversations.create_conversation(title="Apple margins")
+
+    def fake_generate_answer_stream(*args, **kwargs):
+        yield _fake_answer(answer_text="Margins declined.")
+
+    monkeypatch.setattr(chat_routes, "generate_answer_stream", fake_generate_answer_stream)
+
+    # No query params at all -- the token only travels via X-Session-Token.
+    with client.stream(
+        "POST",
+        "/chat/stream",
+        json={"query": "what about it", "session_id": conversation_id},
+        headers={"X-Session-Token": token},
+    ) as r:
+        assert r.status_code == 200
+
+
+def test_demo_key_middleware_allows_chat_stream_via_header(monkeypatch, client):
+    monkeypatch.setattr(settings, "DEMO_ACCESS_KEY", "secret")
+
+    def fake_generate_answer_stream(*args, **kwargs):
+        yield _fake_answer(answer_text="Margins declined.")
+
+    monkeypatch.setattr(chat_routes, "generate_answer_stream", fake_generate_answer_stream)
+
+    with client.stream(
+        "POST", "/chat/stream", json={"query": "q"}, headers={"X-Demo-Key": "secret"}
+    ) as r:
+        assert r.status_code == 200
+
+
+def test_demo_key_middleware_no_longer_accepts_query_param(monkeypatch, client):
+    """Regression test: `?key=` used to be a valid way to supply the demo
+    key (needed only because EventSource couldn't set headers). Now that
+    every protected route -- including chat streaming -- is fetch()-driven
+    and can set a real header, the query-param fallback must be gone."""
+    monkeypatch.setattr(settings, "DEMO_ACCESS_KEY", "secret")
+    response = client.get("/documents", params={"key": "secret"})
+    assert response.status_code == 401
 
 
 def test_chat_rate_limit_returns_429_past_threshold(monkeypatch, client):
@@ -297,9 +350,9 @@ def test_chat_stream_404s_when_session_token_missing(client):
     conversation_id, _token = conversations.create_conversation(title="private")
 
     with client.stream(
-        "GET",
+        "POST",
         "/chat/stream",
-        params={"query": "q", "session_id": conversation_id},
+        json={"query": "q", "session_id": conversation_id},
     ) as r:
         assert r.status_code == 404
 
@@ -313,7 +366,23 @@ def test_documents_list_empty(client):
     assert response.json() == []
 
 
+def test_documents_upload_403_by_default_when_allow_uploads_unset(tmp_path, client):
+    """Regression test: ALLOW_UPLOADS now defaults to disabled (fail closed)
+    -- a deployment that forgets to set it must not accidentally expose an
+    open PDF-upload service."""
+    pdf_path = _make_sample_pdf(tmp_path)
+
+    with open(pdf_path, "rb") as f:
+        response = client.post(
+            "/documents/upload",
+            files={"file": (pdf_path.name, f, "application/pdf")},
+        )
+
+    assert response.status_code == 403
+
+
 def test_documents_upload_success(monkeypatch, tmp_path, client):
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
     monkeypatch.setattr(documents_routes, "ingest_pdf", lambda *a, **kw: _FakeDocument())
     pdf_path = _make_sample_pdf(tmp_path)
 
@@ -330,11 +399,130 @@ def test_documents_upload_success(monkeypatch, tmp_path, client):
     assert body["status"] == "ready"
 
 
-def test_documents_upload_rejects_non_pdf(client):
+def test_documents_upload_rejects_non_pdf(monkeypatch, client):
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
     response = client.post(
         "/documents/upload", files={"file": ("notes.txt", b"hello", "text/plain")}
     )
     assert response.status_code == 400
+
+
+def test_documents_upload_rejects_pdf_extension_with_non_pdf_content(monkeypatch, client):
+    """A file merely *named* .pdf must not be trusted -- its content is
+    checked for the real PDF magic header and must actually parse."""
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("fake.pdf", b"not actually a pdf, just bytes", "application/pdf")},
+    )
+    assert response.status_code == 400
+
+    # The rejected upload must not leave a partial file behind -- including
+    # the internal staging file it was streamed to before validation.
+    assert not (settings.RAW_DIR / "fake.pdf").exists()
+    assert list(settings.RAW_DIR.glob(".upload-*")) == []
+
+
+def test_documents_upload_rejects_oversized_file(monkeypatch, client):
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", 100)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("big.pdf", b"%PDF-1.4\n" + b"0" * 1000, "application/pdf")},
+    )
+
+    assert response.status_code == 413
+    assert not (settings.RAW_DIR / "big.pdf").exists()
+    assert list(settings.RAW_DIR.glob(".upload-*")) == []
+
+
+def test_documents_upload_oversized_body_never_reaches_ingest(monkeypatch, client):
+    """Regression test: Starlette's own multipart parser has no size cap on
+    file parts (only on plain form fields) and fully buffers/spools an
+    upload to disk *before* FastAPI's route function -- and therefore
+    api/routes/documents.py's own MAX_UPLOAD_BYTES check -- ever runs.
+    MaxUploadBodySizeMiddleware (api/middleware.py) is what actually stops
+    an oversized upload; this proves it rejects the request before
+    ingest_pdf is ever called, not just before the route's own check."""
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", 1024)
+
+    def failing_ingest_pdf(*args, **kwargs):
+        raise AssertionError("ingest_pdf must never be called for an oversized upload")
+
+    monkeypatch.setattr(documents_routes, "ingest_pdf", failing_ingest_pdf)
+
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("big.pdf", b"%PDF-1.4\n" + b"0" * (5 * 1024 * 1024), "application/pdf")},
+    )
+
+    assert response.status_code == 413
+    assert not (settings.RAW_DIR / "big.pdf").exists()
+
+
+def test_documents_upload_rejects_oversized_page_count(monkeypatch, tmp_path, client):
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
+    monkeypatch.setattr(settings, "MAX_UPLOAD_PAGES", 0)
+    pdf_path = _make_sample_pdf(tmp_path)
+
+    with open(pdf_path, "rb") as f:
+        response = client.post(
+            "/documents/upload",
+            files={"file": (pdf_path.name, f, "application/pdf")},
+        )
+
+    assert response.status_code == 413
+    assert not (settings.RAW_DIR / pdf_path.name).exists()
+    assert list(settings.RAW_DIR.glob(".upload-*")) == []
+
+
+def test_documents_upload_rejects_path_traversal_filename(monkeypatch, client):
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
+    response = client.post(
+        "/documents/upload",
+        files={"file": ("../../etc/evil.pdf", b"%PDF-1.4\n", "application/pdf")},
+    )
+    # Starlette's multipart parser itself collapses "../" out of the
+    # filename it hands to the route, so this either 400s inside the route
+    # or lands harmlessly under RAW_DIR -- either way, nothing must ever be
+    # written outside RAW_DIR.
+    assert response.status_code in (200, 400, 413, 500)
+    assert not (settings.RAW_DIR.parent.parent / "etc" / "evil.pdf").exists()
+
+
+def test_documents_upload_does_not_overwrite_existing_file_with_same_name(
+    monkeypatch, tmp_path, client
+):
+    """Regression test: re-uploading (or an attacker uploading) a file with
+    the same name as an already-ingested document used to silently
+    overwrite that file's bytes on disk, and delete it entirely if the new
+    upload then failed to ingest -- destroying the original with nothing to
+    show for it."""
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
+    filename = "Apple_FY25_filing.pdf"
+
+    settings.RAW_DIR.mkdir(parents=True, exist_ok=True)
+    existing_path = settings.RAW_DIR / filename
+    original_bytes = b"%PDF-1.4\noriginal content from a prior successful ingest"
+    existing_path.write_bytes(original_bytes)
+
+    pdf_path = _make_sample_pdf(tmp_path, filename=filename)
+    monkeypatch.setattr(documents_routes, "ingest_pdf", lambda *a, **kw: _FakeDocument())
+
+    with open(pdf_path, "rb") as f:
+        response = client.post(
+            "/documents/upload",
+            files={"file": (filename, f, "application/pdf")},
+        )
+
+    assert response.status_code == 200
+    # The pre-existing file must be byte-for-byte untouched.
+    assert existing_path.read_bytes() == original_bytes
+    # The new upload must have landed somewhere else, not been dropped.
+    other_files = [p for p in settings.RAW_DIR.glob("*.pdf") if p != existing_path]
+    assert len(other_files) == 1
 
 
 def test_documents_upload_403_when_uploads_disabled(monkeypatch, tmp_path, client):
@@ -351,6 +539,7 @@ def test_documents_upload_403_when_uploads_disabled(monkeypatch, tmp_path, clien
 
 
 def test_documents_upload_rate_limit_returns_429_past_threshold(monkeypatch, tmp_path, client):
+    monkeypatch.setattr(settings, "ALLOW_UPLOADS", True)
     monkeypatch.setattr(documents_routes, "ingest_pdf", lambda *a, **kw: _FakeDocument())
     pdf_path = _make_sample_pdf(tmp_path)
 
@@ -404,19 +593,42 @@ def test_demo_key_middleware_allows_matching_header(monkeypatch, client):
     assert response.status_code == 200
 
 
-def test_demo_key_middleware_allows_matching_query_param(monkeypatch, client):
-    # GET /chat/stream is consumed via the browser's native EventSource,
-    # which can't set custom headers -- a `key` query param is the only way
-    # it can supply this at all (see api/middleware.py's module docstring).
-    monkeypatch.setattr(settings, "DEMO_ACCESS_KEY", "secret")
-    response = client.get("/documents", params={"key": "secret"})
-    assert response.status_code == 200
+# --- startup: empty demo corpus should be surfaced, not silently served ---
 
 
-def test_demo_key_middleware_401s_with_wrong_query_param(monkeypatch, client):
-    monkeypatch.setattr(settings, "DEMO_ACCESS_KEY", "secret")
-    response = client.get("/documents", params={"key": "wrong"})
-    assert response.status_code == 401
+def test_startup_warns_when_no_documents_ingested(caplog):
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        with TestClient(app):
+            pass
+
+    assert any("no documents are ingested" in record.message for record in caplog.records)
+
+
+def test_startup_does_not_warn_when_documents_exist(monkeypatch, caplog):
+    import logging
+
+    from sage.db.database import get_session
+    from sage.db.models import Document
+
+    session = get_session()
+    session.add(
+        Document(
+            filename="Apple_FY25_filing.pdf",
+            source_path="/tmp/Apple_FY25_filing.pdf",
+            page_count=1,
+            status="ready",
+        )
+    )
+    session.commit()
+    session.close()
+
+    with caplog.at_level(logging.WARNING, logger="api.main"):
+        with TestClient(app):
+            pass
+
+    assert not any("no documents are ingested" in record.message for record in caplog.records)
 
 
 # --- routing: wrong-method requests should 405, not fall through to the

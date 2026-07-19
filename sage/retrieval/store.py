@@ -43,6 +43,24 @@ def add(
     )
 
 
+def upsert(
+    ids: list[str],
+    embeddings: list[list[float]],
+    metadatas: list[dict],
+    documents: list[str] | None = None,
+    collection_name: str = settings.CHROMA_COLLECTION,
+) -> None:
+    # Unlike add(), safe to call again for an id that already exists --
+    # replaces its embedding/document/metadata in place instead of raising
+    # or leaving a stale duplicate. Used by the semantic query cache
+    # (sage/generation/cache.py) when refreshing an expired cache row: the
+    # old vector for that cache_key must not keep pointing at the
+    # about-to-be-replaced answer.
+    get_collection(collection_name).upsert(
+        ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas
+    )
+
+
 def query(
     embedding: list[float],
     top_k: int,

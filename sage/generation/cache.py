@@ -122,6 +122,7 @@ def get_semantic_cached(
     fiscal_year: str | None,
     doc_type: str | None,
     model: str,
+    query_embedding: list[float] | None = None,
 ) -> QueryCache | None:
     """Embedding-similarity fallback, checked on an exact-match miss.
 
@@ -130,8 +131,13 @@ def get_semantic_cached(
     its QueryCache row if within SEMANTIC_CACHE_THRESHOLD squared-L2
     distance. Delegates to `get_cached` for the final lookup, so an expired
     underlying row is treated as a miss here too.
+
+    `query_embedding`, if given, is reused instead of re-embedding
+    `query_text` -- the caller (answer_engine.generate_answer) computes this
+    once per request and reuses it here and for retrieval, rather than
+    embedding the identical query text twice.
     """
-    embedding = embed_query(query_text)
+    embedding = query_embedding if query_embedding is not None else embed_query(query_text)
     where = _semantic_where(companies, fiscal_year, doc_type, model)
     result = store.query(
         embedding, top_k=1, where=where, collection_name=settings.CHROMA_QUERY_CACHE_COLLECTION
@@ -156,40 +162,69 @@ def store_cached(
     companies: list[str] | None = None,
     fiscal_year: str | None = None,
     doc_type: str | None = None,
+    query_embedding: list[float] | None = None,
 ) -> None:
+    """Insert a fresh cache entry, or refresh an existing *expired* one in
+    place -- a still-fresh row (written by a concurrent request that beat
+    this one to it) is left alone.
+
+    Without the expired-row refresh path, `get_cached()` correctly treats an
+    expired row as a miss at read time, but this function's old `if existing
+    is not None: return` treated the row's mere presence (expired or not) as
+    "already cached" and silently discarded every regenerated answer for
+    that key forever after -- the cache could never recover from staleness.
+
+    The semantic Chroma cache is kept in step via `store.upsert` (not
+    `store.add`): a plain add() for an id that already exists (the expired
+    row's old semantic vector) would either raise or leave a stale vector
+    still pointing at the citations/answer this call is about to replace.
+    """
     session = get_session()
-    inserted = False
+    should_refresh_semantic = False
     try:
         existing = session.query(QueryCache).filter(QueryCache.cache_key == cache_key).first()
-        if existing is not None:
+        if existing is not None and not _is_expired(existing.created_at):
             return
-        session.add(
-            QueryCache(
-                cache_key=cache_key,
-                query_text=query_text,
-                model_name=model,
-                answer_text=answer_text,
-                citations_json=citations,
-                retrieved_chunk_ids=retrieved_chunk_ids,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
+
+        if existing is not None:
+            existing.query_text = query_text
+            existing.model_name = model
+            existing.answer_text = answer_text
+            existing.citations_json = citations
+            existing.retrieved_chunk_ids = retrieved_chunk_ids
+            existing.prompt_tokens = prompt_tokens
+            existing.completion_tokens = completion_tokens
+            existing.total_tokens = total_tokens
+            existing.created_at = datetime.now(UTC)
+        else:
+            session.add(
+                QueryCache(
+                    cache_key=cache_key,
+                    query_text=query_text,
+                    model_name=model,
+                    answer_text=answer_text,
+                    citations_json=citations,
+                    retrieved_chunk_ids=retrieved_chunk_ids,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                )
             )
-        )
         try:
             session.commit()
-            inserted = True
+            should_refresh_semantic = True
         except IntegrityError:
-            # Another concurrent request cached the same key first; nothing to do.
+            # Another concurrent request won the race to insert this same
+            # new key first; nothing more to do.
             session.rollback()
     finally:
         session.close()
 
-    if not inserted:
+    if not should_refresh_semantic:
         return
 
-    embedding = embed_query(query_text)
-    store.add(
+    embedding = query_embedding if query_embedding is not None else embed_query(query_text)
+    store.upsert(
         ids=[cache_key],
         embeddings=[embedding],
         documents=[query_text],

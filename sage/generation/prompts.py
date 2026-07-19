@@ -50,10 +50,12 @@ CITATION_FORMAT_INSTRUCTION = (
     "After your answer, you MUST end your response with a fenced code block "
     "that starts with the exact line ```citations and ends with the exact "
     "line ```. Do not omit the triple backticks. Inside the fence, put a JSON "
-    "array of every chunk number you cited, each with its chunk_id. Example "
-    "of the exact required format:\n"
+    "array of the bracket numbers [n] you cited above -- nothing else. Do "
+    "NOT include a chunk_id or any other field; the number alone is enough, "
+    "since [n] always refers to the chunk labeled [n] above. Example of the "
+    "exact required format:\n"
     "```citations\n"
-    '[{"n": 1, "chunk_id": 42}, {"n": 3, "chunk_id": 47}]\n'
+    "[1, 3]\n"
     "```"
 )
 

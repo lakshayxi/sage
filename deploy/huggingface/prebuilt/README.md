@@ -30,8 +30,10 @@ Dockerfile's `COPY` steps succeed unconditionally, whether or not the real
 data has landed yet, so the image always builds — it just serves an empty
 corpus until the real files replace these placeholders.
 
-Generating the real data is blocked on a separate Gemini API quota issue
-(embedding calls need `GEMINI_API_KEY` quota headroom for ~3 full 10-Ks).
+Generating the real data isn't blocked on a Gemini quota issue anymore —
+embeddings now run locally (`sage/embed/local_embedder.py`), so `sage ingest`
+makes no Gemini calls at all. The only remaining blocker is that nobody has
+run the three-command sequence below yet.
 
 ## How to (re)generate this
 

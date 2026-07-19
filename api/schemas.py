@@ -3,13 +3,15 @@ schema_version -- bump it on any breaking response-shape change."""
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from config import settings
 
 SCHEMA_VERSION = 1
 
 
 class ChatRequest(BaseModel):
-    query: str
+    query: str = Field(min_length=1, max_length=settings.MAX_QUERY_LENGTH)
     companies: list[str] | None = None
     fiscal_year: str | None = None
     doc_type: str | None = None

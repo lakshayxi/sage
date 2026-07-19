@@ -132,15 +132,19 @@ def _retrieve_hybrid_single(
     company: str | None,
     fiscal_year: str | None,
     doc_type: str | None,
+    query_embedding: list[float],
 ) -> list[RetrievedChunk]:
     """Vector similarity + BM25 keyword search for a single company (or no
     company filter at all), fused via reciprocal rank fusion.
 
     Both signals are restricted to the same company/fiscal_year/doc_type
     filter so the fused ranking never mixes in chunks that don't match.
+    `query_embedding` is precomputed by the caller (`retrieve_hybrid`) once
+    per request and reused across every company -- the same query text would
+    otherwise be re-embedded once per company in a multi-company comparison,
+    all producing the identical vector.
     """
     where = _build_where(company, fiscal_year, doc_type)
-    query_embedding = embed_query(query_text)
     vector_result = store.query(query_embedding, top_k=top_k, where=where)
     vector_ids = [int(i) for i in vector_result.get("ids", [[]])[0]]
 
@@ -210,6 +214,7 @@ def retrieve_hybrid(
     companies: list[str] | None = None,
     fiscal_year: str | None = None,
     doc_type: str | None = None,
+    query_embedding: list[float] | None = None,
 ) -> list[RetrievedChunk]:
     """Hybrid retrieval, company-aware for single- and multi-company queries.
 
@@ -221,15 +226,26 @@ def retrieve_hybrid(
       scoped to that company alone, and each keeping its own full `top_k`
       budget -- not a `top_k` shared across companies), merged round-robin
       -- see `_merge_balanced`.
+
+    `query_embedding`, if given, is used as-is instead of re-embedding
+    `query_text` -- lets a caller that already embedded this exact query
+    text (e.g. for a semantic cache lookup) reuse that vector instead of
+    computing an identical one again. Computed here (once, not per company)
+    when omitted.
     """
+    if query_embedding is None:
+        query_embedding = embed_query(query_text)
+
     normalized = _normalize_companies(companies)
 
     if len(normalized) <= 1:
         company = normalized[0] if normalized else None
-        return _retrieve_hybrid_single(query_text, top_k, company, fiscal_year, doc_type)
+        return _retrieve_hybrid_single(
+            query_text, top_k, company, fiscal_year, doc_type, query_embedding
+        )
 
     per_company_results = [
-        _retrieve_hybrid_single(query_text, top_k, company, fiscal_year, doc_type)
+        _retrieve_hybrid_single(query_text, top_k, company, fiscal_year, doc_type, query_embedding)
         for company in normalized
     ]
     return _merge_balanced(per_company_results)

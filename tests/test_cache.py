@@ -279,6 +279,83 @@ def test_semantic_cache_respects_comparison_vs_single_company(monkeypatch):
     assert miss is None
 
 
+def test_store_cached_replaces_expired_row_with_fresh_value(monkeypatch):
+    """Regression test: store -> expire -> miss -> regenerate -> store
+    replacement -> hit fresh value. The old `if existing is not None:
+    return` treated an expired-but-present row as already cached, so a
+    regenerated answer could never overwrite it -- get_cached() would keep
+    returning None (miss) forever, even after a successful regeneration."""
+    query_text = "expiring then regenerated query"
+    key = cache.make_cache_key(query_text, None, None, None, "gemini-2.5-flash")
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
+
+    cache.store_cached(key, query_text, "gemini-2.5-flash", "stale answer", [], [], 1, 1, 2)
+    assert cache.get_cached(key).answer_text == "stale answer"
+
+    expired_at = datetime.now(UTC) - timedelta(seconds=settings.CACHE_TTL_SECONDS + 1)
+    session = get_session()
+    session.query(QueryCache).filter(QueryCache.cache_key == key).update({"created_at": expired_at})
+    session.commit()
+    session.close()
+
+    assert cache.get_cached(key) is None  # expired -> miss
+
+    cache.store_cached(
+        key, query_text, "gemini-2.5-flash", "fresh regenerated answer", [], [], 3, 3, 6
+    )
+
+    fresh = cache.get_cached(key)
+    assert fresh is not None
+    assert fresh.answer_text == "fresh regenerated answer"
+    assert fresh.total_tokens == 6
+
+    # Exactly one row for this key -- the expired row was refreshed in
+    # place, not left behind alongside a second inserted row.
+    session = get_session()
+    count = session.query(QueryCache).filter(QueryCache.cache_key == key).count()
+    session.close()
+    assert count == 1
+
+
+def test_store_cached_does_not_replace_a_still_fresh_row(monkeypatch):
+    """The expired-row refresh path must not also start clobbering rows that
+    are still within TTL -- only an actually-expired row is eligible."""
+    query_text = "still fresh query"
+    key = cache.make_cache_key(query_text, None, None, None, "gemini-2.5-flash")
+    monkeypatch.setattr(cache, "embed_query", lambda text: [0.0] * 8)
+
+    cache.store_cached(key, query_text, "gemini-2.5-flash", "first answer", [], [], 1, 1, 2)
+    cache.store_cached(key, query_text, "gemini-2.5-flash", "second answer", [], [], 1, 1, 2)
+
+    assert cache.get_cached(key).answer_text == "first answer"
+
+
+def test_semantic_cache_reflects_refreshed_answer_after_expired_replacement(monkeypatch):
+    """The semantic Chroma cache must not keep pointing at the pre-refresh
+    answer after an expired row is replaced -- store_cached upserts the
+    semantic vector rather than leaving the old one in place."""
+    query_text = "semantic refresh base"
+    near_query = "semantic refresh near"
+    monkeypatch.setattr(
+        cache, "embed_query", _fake_embedder({query_text: [1.0, 0.0], near_query: [0.99, 0.01]})
+    )
+
+    key = cache.make_cache_key(query_text, None, None, None, "gemini-2.5-flash")
+    cache.store_cached(key, query_text, "gemini-2.5-flash", "stale answer", [], [], 1, 1, 2)
+
+    expired_at = datetime.now(UTC) - timedelta(seconds=settings.CACHE_TTL_SECONDS + 1)
+    session = get_session()
+    session.query(QueryCache).filter(QueryCache.cache_key == key).update({"created_at": expired_at})
+    session.commit()
+    session.close()
+
+    cache.store_cached(key, query_text, "gemini-2.5-flash", "fresh answer", [], [], 1, 1, 2)
+
+    hit = cache.get_semantic_cached(near_query, None, None, None, "gemini-2.5-flash")
+    assert hit is not None
+    assert hit.answer_text == "fresh answer"
+
+
 def test_semantic_cache_treats_expired_underlying_row_as_miss(monkeypatch):
     base_query = "semantic expired base"
     near_query = "semantic expired near"

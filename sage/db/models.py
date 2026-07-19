@@ -33,6 +33,20 @@ class Document(Base):
     embedding_model = Column(String, nullable=True)
     ingested_at = Column(DateTime, default=_utcnow)
     status = Column(String, default="pending")  # pending|processing|ready|failed
+    # sha256 of the raw PDF bytes -- lets sage/ingest/pipeline.py detect an
+    # identical file being re-ingested and skip creating a duplicate
+    # Document/Chunk set. Nullable (rows ingested before this column existed
+    # have no checksum backfilled -- see sage/db/database.py's init_db() for
+    # the auto-migration that adds this column to a pre-existing db/sage.db,
+    # and the ingest pipeline's module docstring for the dedup semantics of
+    # a NULL checksum) but unique when set: SQL treats multiple NULLs as
+    # distinct (never colliding with each other), so this doesn't affect
+    # legacy rows, but it does close the race ingest_pdf's own
+    # check-then-insert dedup can't fully close on its own -- two truly
+    # concurrent uploads of the same new file both passing the "not found
+    # yet" pre-check before either commits. The second commit fails with an
+    # IntegrityError instead of silently creating a duplicate Document.
+    checksum = Column(String, nullable=True, unique=True, index=True)
 
     chunks = relationship("Chunk", back_populates="document", cascade="all, delete-orphan")
 

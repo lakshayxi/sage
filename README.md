@@ -15,20 +15,23 @@ Most "chat with your PDF" tools optimize for a demo, not for trust. Sage is buil
 
 ## Features
 
-- **Grounded, cited answers** — every factual claim resolves to a specific ingested chunk (company / fiscal year / doc type / page), with a hard relevance gate: if nothing retrieved clears the cross-encoder's relevance threshold, the LLM is never even called.
+- **Grounded, cited answers** — every factual claim resolves to a specific ingested chunk (company / fiscal year / doc type / page), with a hard relevance gate: if nothing retrieved clears the cross-encoder's relevance threshold, the LLM is never even called. Citation numbers resolve deterministically by position against the chunks actually shown to the model — a citation's identity is never taken from the model's own (possibly wrong) `chunk_id` echo.
 - **Compare Mode** — ask about multiple companies in one query; each company gets its own independent retrieval and reranking budget instead of sharing one pool, and the prompt auto-switches to a structured per-company-then-comparison format.
-- **Hybrid retrieval** — BM25 keyword search + vector similarity, fused via reciprocal rank fusion, narrowed by a `BAAI/bge-reranker-base` cross-encoder.
+- **Hybrid retrieval** — BM25 keyword search + vector similarity, fused via reciprocal rank fusion, narrowed by a `BAAI/bge-reranker-base` cross-encoder. A query is embedded exactly once per request and reused across the semantic cache check and every company's retrieval call in a comparison query, not re-embedded per company.
 - **Fully local embeddings** — `sentence-transformers` (`BAAI/bge-small-en-v1.5`) runs in-process, so retrieval has zero API cost and zero quota risk; only generation calls out to Gemini.
-- **Live streaming answers** over SSE, with a fence-buffered stream so the model's internal citation-JSON block never leaks into what the user sees typing.
+- **Live streaming answers** via `fetch()` + a streamed `ReadableStream` (not `EventSource`), so the query, filters, and session token travel in a POST body/headers instead of a URL query string — with a fence-buffered stream so the model's internal citation-JSON block never leaks into what the user sees typing.
 - **Resumable, session-isolated conversations** — multi-turn history per conversation, scoped to an unguessable per-visitor session token so one visitor can never read another's questions or answers.
-- **Two-layer query cache** — exact-match (SQLite) checked first, semantic (embedding-similarity, Chroma-backed) on a miss, both TTL-expiring.
-- **Public-deployment guardrails** — a shared demo-key gate, per-route rate limiting, and an upload kill-switch (`ALLOW_UPLOADS=false`) so a public demo can't be turned into an open PDF-processing service.
+- **Two-layer query cache** — exact-match (SQLite) checked first, semantic (embedding-similarity, Chroma-backed) on a miss, both TTL-expiring; an expired row is refreshed in place by the next generated answer rather than blocking future writes forever.
+- **Page-exact chunking** — a chunk never spans a page boundary and an oversized paragraph is split into bounded, overlapping windows, so a citation's page number is always exactly right, never just "the page the chunk started on."
+- **Recoverable, idempotent ingestion** — a checksum-based dedup skips re-ingesting identical file content, and a failure partway through cleans up any Chroma vectors already written so nothing is orphaned across the two separate (non-transactional) stores.
+- **Retrieval-quality eval harness** (`sage-eval`) — an 18-item hand-curated Q&A set (including multi-turn follow-ups and distractor-adjacent unanswerable items) run against the real ingested corpus with caching disabled, scored on numeric correctness, citation grounding, citation-text support, recall@k, and citation-number mapping validity — not just "did retrieval return something."
+- **Public-deployment guardrails** — a rate-limited, non-secret demo-access deterrent (not a real auth boundary — see Design decisions), and uploads disabled by default (`ALLOW_UPLOADS=false`) with streamed/bounded/content-validated writes when enabled, so a public demo can't be turned into an open PDF-processing service.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    UI["React + Vite workspace<br/>frontend/src"] -->|fetch / EventSource| API
+    UI["React + Vite workspace<br/>frontend/src"] -->|fetch + ReadableStream| API
 
     subgraph API["FastAPI (api/)"]
         Chat["/chat, /chat/stream"]
@@ -122,7 +125,7 @@ sage/
 │   └── retry.py            # Backoff wrapper for Gemini 429/5xx
 ├── frontend/              # React + Vite workspace UI (three-panel layout)
 │   └── src/
-│       ├── api/             # Typed fetch/EventSource client, session-token handling
+│       ├── api/             # Typed fetch client (incl. streamed ReadableStream parsing), session-token handling
 │       ├── components/      # Sidebar, MainPanel, RightPanel, citation UI
 │       ├── context/         # Bidirectional citation-highlight state
 │       └── hooks/           # useChatSession (SSE consumption), useTheme
@@ -130,10 +133,13 @@ sage/
 ├── deploy/huggingface/    # Space config, deploy guide, pre-ingested demo corpus
 ├── scripts/deploy_hf_space.py
 ├── Dockerfile             # Single image: node build stage + python runtime stage
+├── .github/workflows/ci.yml  # Backend tests+ruff, frontend lint+typecheck+build
+├── requirements-lock.txt  # Reproducible pinned deps (pip freeze), see Installation
 ├── docs/
 │   ├── reviews/            # Dated pre-deploy code + security review logs
 │   └── user-testing/        # Dated live-testing session logs
-└── tests/                 # 144 tests, no live Ollama/Gemini required
+├── eval/                  # Hand-curated Q&A eval harness (sage-eval)
+└── tests/                 # 224 tests, no live Gemini required
 ```
 
 ## API reference
@@ -141,7 +147,7 @@ sage/
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/chat` | Non-streaming Q&A — answer + resolved citations in one response |
-| `GET` | `/chat/stream` | Same, as an SSE token stream |
+| `POST` | `/chat/stream` | Same, as an SSE-formatted token stream (fetch + `ReadableStream` on the frontend, not `EventSource` — query/filters in the body, session token as a header) |
 | `POST` | `/conversations` | Start a new conversation, returns `conversation_id` + a session token |
 | `GET` | `/conversations` | List conversations belonging to the caller's session token |
 | `GET` | `/conversations/{id}` | Full message history for one conversation (session-scoped) |
@@ -180,7 +186,10 @@ All settings live in `config/settings.py`, loaded via `python-dotenv` from a `.e
 | `SAGE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model — changing this requires re-ingesting (`data/chroma/` vector dimensionality changes) |
 | `DEMO_ACCESS_KEY` | unset (no-op) | Gates `/chat`, `/conversations`, `/documents` behind a shared key on public deployments |
 | `VITE_DEMO_ACCESS_KEY` | unset | Build-time frontend counterpart to `DEMO_ACCESS_KEY` — must match, baked in at `npm run build` |
-| `ALLOW_UPLOADS` | `true` | Set `false` on public deployments — the curated-demo boundary |
+| `ALLOW_UPLOADS` | `false` | Set `true` to allow `POST /documents/upload` — off by default (fail closed) so a deployment that forgets to set this doesn't accidentally expose an open PDF-upload service |
+| `MAX_UPLOAD_BYTES` | `26214400` (25MB) | Hard ceiling on a single upload's size, enforced while it streams to disk |
+| `MAX_UPLOAD_PAGES` | `500` | Hard ceiling on a single upload's page count, checked before ingestion |
+| `MAX_QUERY_LENGTH` | `2000` | Hard ceiling on a single chat query's character length |
 | `CHAT_RATE_LIMIT` | `10/minute` | `slowapi` rate-limit spec applied to `/chat`, `/chat/stream`, and uploads |
 
 ## Installation
@@ -197,6 +206,13 @@ npm ci
 npm run build   # produces frontend/dist, served by the same FastAPI process
 ```
 
+For a reproducible install pinned to exact versions instead of `pyproject.toml`'s `>=` floors, use the committed lock file (`requirements-lock.txt`, generated via `pip freeze` — see its header comment for how to regenerate after a dependency change):
+
+```bash
+.venv/bin/pip install -r requirements-lock.txt
+.venv/bin/pip install -e . --no-deps
+```
+
 ## Quick start
 
 ```bash
@@ -205,6 +221,9 @@ npm run build   # produces frontend/dist, served by the same FastAPI process
 
 # ask from the CLI
 .venv/bin/sage ask "What was Apple's revenue in fiscal 2025?"
+
+# check retrieval/generation quality against the hand-curated eval set
+.venv/bin/sage-eval --limit 3
 
 # or run the full app
 .venv/bin/uvicorn api.main:app --reload
@@ -219,10 +238,12 @@ Compare Mode from the CLI (repeat `--company` to trigger it):
 .venv/bin/sage ask "Compare R&D spend trends" --company Apple --company Microsoft --company NVIDIA
 ```
 
-Streaming from the API:
+Streaming from the API (POST with a JSON body, not a query-string GET — see [Design decisions](#design-decisions)):
 
 ```bash
-curl -N "http://localhost:8000/chat/stream?query=How+did+NVIDIA%27s+gross+margin+change&companies=NVIDIA"
+curl -N -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query": "How did NVIDIA'"'"'s gross margin change", "companies": ["NVIDIA"]}'
 ```
 
 Resuming a conversation:
@@ -246,40 +267,53 @@ Running the test suite (no live Gemini/network required):
 
 **Embeddings run locally; generation doesn't.** Gemini's free embedding tier hit a hard, non-recoverable quota wall during development — and embeddings are needed on every single query (not just at ingest time), making that a structural risk rather than a one-off. Swapping to a local `sentence-transformers` model removed the risk entirely while keeping generation on Gemini, where the same problem never surfaced in practice.
 
+**Queries get BGE's asymmetric instruction prefix; indexed passages don't.** `BAAI/bge-small-en-v1.5` is documented to benefit from a `"Represent this sentence for searching relevant passages: "` prefix on the query side only — passages stay unprefixed so already-indexed Chroma vectors remain valid without a re-ingest. `sage/embed/local_embedder.py`'s `embed_query()` applies the prefix and is used by retrieval and the semantic cache; ingestion still calls the unprefixed `embed_text()`/`embed_texts()`.
+
 **Compare Mode gives each company its own retrieval and reranking budget, not a shared one.** An earlier version reranked all companies' candidates together against one shared `top_k`, which let whichever company's chunks scored marginally higher crowd out the others — a 3-company query could come back with real data for one company and "insufficient context" for the rest, even when the data existed. Each company now gets an independently reranked, independently budgeted slice of context.
 
 **Session isolation via an unguessable token, not a login system.** Conversations are scoped to a server-issued `secrets.token_urlsafe(32)` stored client-side, not a user account — enough to stop one visitor reading another's history on a public demo, without building auth for a single-operator portfolio project.
 
-**The demo-key guardrail supports a query parameter, not just a header.** The browser's native `EventSource` (used for the streaming endpoint) cannot set custom request headers — a hard platform limitation — so `DemoKeyMiddleware` accepts the key via `?key=` for that one endpoint, and a header everywhere else.
+**Streaming is `fetch()` + `ReadableStream`, not `EventSource`.** The browser's native `EventSource` can only issue GET requests and can't set custom headers, which used to force the query text, session token, and demo access key into the `/chat/stream` URL's query string — leaking into server access logs, browser history, and any `Referer` header. `POST /chat/stream` now takes the query/filters as a JSON body and the session token as an `X-Session-Token` header, exactly like `POST /chat`, and the frontend reads the streamed response body incrementally instead of relying on the browser's SSE parser. `DemoKeyMiddleware` only accepts the key via the `X-Demo-Key` header now — no query-param fallback remains, since every client here is `fetch()`-based and can set real headers.
+
+**The demo access key is a casual-access deterrent, not a real secret.** `VITE_DEMO_ACCESS_KEY` is compiled into the public JS bundle by Vite at build time — anyone can read it straight out of the deployed site's own source, so it cannot be an authentication boundary. It exists to keep an unlisted demo URL out of casual crawler/scraper traffic, not to stop a deliberate actor; the actual defense against abuse of the costly Gemini-backed endpoints is `CHAT_RATE_LIMIT` (per-IP, applied to every chat and upload route). A deployment that needs real access control should put this app behind its own auth layer rather than treating `DEMO_ACCESS_KEY` as one.
+
+**Citation identity is positional, never taken from the model's own `chunk_id`.** The model is shown chunks labeled `[1]`, `[2]`, ... in the prompt and asked to cite bracket numbers; `_resolve_citations` (`sage/generation/answer_engine.py`) resolves `[n]` to `chunks[n - 1]` deterministically and ignores any `chunk_id` the model echoes back. Trusting the model's `chunk_id` would let a hallucinated or malformed value silently remap a visible `[1]` citation to a completely different retrieved chunk than the one actually shown as `[1]`.
+
+**Chunks never cross a page boundary.** Each page is chunked independently (`sage/ingest/chunker.py`), and a paragraph alone larger than `CHUNK_TOKENS` is split into bounded, overlapping windows rather than becoming one unbounded chunk. **No re-ingestion is required** for documents ingested before this fix — the schema didn't change, and existing chunks remain valid and citable — but any chunk that happened to span two pages under the old chunker keeps its (slightly imprecise) page attribution until that document is re-ingested.
+
+**Ingestion is idempotent via a content checksum, with compensating cleanup on failure.** `sage/ingest/pipeline.py` hashes the raw PDF and skips re-ingesting identical content already marked `ready`; if a failure happens after Chroma vectors were written but before the SQLite transaction commits, those specific vectors are deleted rather than left orphaned. Documents ingested before this fix have no checksum (`NULL`, backfilled automatically as a schema migration on next startup) and simply don't participate in dedup until re-ingested — never a false match. This doesn't fully serialize a genuine *concurrent* double-ingest of a brand-new file (a rare race for a synchronous, mostly-CLI/admin-driven operation, not hardened against here).
 
 ## Known limitations
 
 - **Free Hugging Face Spaces have ephemeral storage** — conversations and cache writes on the public deployment don't survive a Space restart.
 - **The reranker model isn't baked into the deployment image** — it downloads from the HF Hub lazily on first use, so the first query after a cold start is noticeably slower than the rest.
 - **No OCR fallback** — PDF text extraction (PyMuPDF) is direct-text-layer only; scanned/image-only filings would extract little or no text.
-- **`MIN_RERANK_SCORE` (0.1) is an empirically-probed starting point**, carried over from a sibling project's corpus, not exhaustively tuned against Sage's own filings.
-- **`ALLOW_UPLOADS` defaults to `true`** — must be explicitly set `false` on any public deployment; there's no separate default for "local" vs "public" beyond this one flag.
+- **`MIN_RERANK_SCORE` (0.1) is still an empirically-probed starting point, not exhaustively tuned** — carried over from a sibling project's corpus, but no longer untouched: a real false-rejection case (an on-topic question with a trailing evaluative clause, e.g. "...were they good?", scored far below plain phrasing of the same question) has been fixed with a targeted one-time retry in `answer_engine.py`, and the eval harness's first real run against Sage's own corpus passed 13/14.
+- **Uploads are synchronous, in-request ingestion** — there's no background job queue, so `MAX_UPLOAD_PAGES` exists specifically to bound how long a single upload request can take; a deployment expecting much larger filings than the 500-page default should raise it deliberately, aware that ingestion latency scales with it.
 
 ## Security notes
 
 - Conversation history is session-token scoped (see [Design decisions](#design-decisions)) — cross-session reads 404 rather than leaking another visitor's data.
 - File upload sanitizes the filename to its basename and verifies the resolved destination path stays inside the intended upload directory before writing, rejecting path-traversal attempts.
-- `POST /documents/upload` is rate-limited and disabled outright (`403`) when `ALLOW_UPLOADS=false`, which is the documented setting for the public deployment.
-- There is no user-account authentication anywhere — `DEMO_ACCESS_KEY` is a single shared secret for gating an entire deployment, not per-visitor identity.
+- Uploads are disabled by default (`ALLOW_UPLOADS=false`), streamed to disk in bounded chunks rather than fully buffered in memory, capped at `MAX_UPLOAD_BYTES`/`MAX_UPLOAD_PAGES`, and verified to actually be a readable PDF (not just named `*.pdf`) before ingestion — a rejected or failed upload is cleaned up rather than left behind in `data/raw/`.
+- `POST /documents/upload` is rate-limited and disabled outright (`403`) when `ALLOW_UPLOADS=false`, which is the default for every deployment, public or local, unless explicitly opted into.
+- There is no user-account authentication anywhere — `DEMO_ACCESS_KEY` is a shared, non-secret casual-access deterrent (it ships inside the public frontend bundle) for an entire deployment, not per-visitor identity or a real security boundary. The actual abuse defense is `CHAT_RATE_LIMIT`.
 
 ## Quality & verification
 
-Two dated, real logs — not just "tests pass":
+Real evidence, not just "tests pass":
 
 - **`docs/reviews/2026-07-18-pre-deploy-review.md`** — a structured, multi-agent code + security review of the full codebase before first deployment; 10 confirmed findings (including a conversation-history access-control gap), all fixed and independently re-verified.
 - **`docs/user-testing/user-testing.md`** — bugs surfaced by hand-driving the live app, including a real SSE stream-truncation bug and a config bug where `GEMINI_API_KEY` silently never loaded at runtime.
+- **`eval/` — an 18-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus — dollar-figure tolerance, citation-grounding, *and* citation-text-supports-the-answer checks (not just filename), plus recall@k, rerank-gate, and citation-number-mapping metrics reported per run (not an LLM judge — see `eval/scoring.py`'s docstring for why). Includes multi-turn follow-up items and unanswerable items with an in-corpus semantically-similar distractor. Always run with `use_cache=False` so a rerun re-tests generation instead of replaying a cached answer. Historical result on the original 14-item set (before the multi-turn/distractor items were added): **13/14 passed**; the one failure was a genuine bug (a declined-to-answer response still carrying a resolved citation), since fixed and re-verified — see `docs/llm-engineer-work-log.md`.
+- **CI** (`.github/workflows/ci.yml`) — runs `pytest tests/`, `ruff check`/`format --check`, and the frontend's `oxlint` + `tsc` typecheck + `vite build` on every push/PR. Does not run `eval/run_eval.py` itself (live Gemini calls, real per-run cost, no offline mode).
 
-144 tests (`tests/`) run with no live Ollama/Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
+224 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
 
 ## Deployment
 
-Single Docker image (frontend build stage + Python runtime stage) targeting a free Hugging Face Docker Space — chosen specifically for its 16GB RAM, which the cross-encoder reranker needs. A pre-ingested demo corpus (Apple, Microsoft, and NVIDIA 10-Ks) is baked into the image so the public demo works with zero setup. Full walkthrough, required secrets, and rollback steps: [`deploy/huggingface/DEPLOY.md`](deploy/huggingface/DEPLOY.md).
+Single Docker image (frontend build stage + Python runtime stage) targeting a free Hugging Face Docker Space — chosen specifically for its 16GB RAM, which the cross-encoder reranker needs. The image is designed to bake in a pre-ingested demo corpus (Apple, Microsoft, and NVIDIA 10-Ks) so the public demo works with zero setup — as of this writing that corpus is still a placeholder and no Space has been deployed yet (see `deploy/huggingface/prebuilt/README.md`'s "Current status" and `deploy/huggingface/DEPLOY.md`'s "Prerequisites"). The app itself checks this at startup and logs a warning if it finds zero ingested documents (`api/main.py`), so an accidentally-empty deployment is visible in the Space's boot logs rather than only discoverable by trying a query by hand. Full walkthrough, required secrets, and rollback steps: [`deploy/huggingface/DEPLOY.md`](deploy/huggingface/DEPLOY.md).
 
 ## Status
 
-Personal portfolio project — the public-facing half of a two-repo project. The research/experimentation half, where retrieval and generation techniques get proven before graduating here, lives at [Sage Research](https://github.com/lakshayxi/sage-research). No LICENSE file is present in this repo.
+Personal portfolio project — the public-facing half of a two-repo project. The research/experimentation half, where retrieval and generation techniques get proven before graduating here, lives at [Sage Research](https://github.com/lakshayxi/sage-research). Source-visible, not licensed for reuse — see [`LICENSE`](LICENSE) for why.

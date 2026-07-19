@@ -1,4 +1,4 @@
-"""POST /chat (non-streaming), GET /chat/stream (SSE)."""
+"""POST /chat (non-streaming), POST /chat/stream (SSE-style, fetch-driven)."""
 
 import json
 
@@ -94,25 +94,28 @@ def chat(
         raise HTTPException(status_code=500, detail="Failed to generate an answer") from None
 
 
-@router.get("/chat/stream")
+@router.post("/chat/stream")
 @limiter.limit(settings.CHAT_RATE_LIMIT)
 def chat_stream(
     request: Request,
-    query: str,
-    companies: list[str] | None = None,
-    fiscal_year: str | None = None,
-    doc_type: str | None = None,
-    session_id: int | None = None,
-    # EventSource (frontend/src/api/chat.ts) can't set custom headers, so
-    # unlike every other conversation-scoped route this takes the session
-    # token as a query param instead of X-Session-Token -- same constraint
-    # DemoKeyMiddleware works around for this same endpoint.
-    session_token: str = "",
+    body: ChatRequest,
+    x_session_token: str = Header(default="", alias="X-Session-Token"),
 ):
-    if session_id is not None and not conversation_belongs_to_session(session_id, session_token):
+    # POST with the query/filters in the JSON body and the session token in
+    # a header -- same shape as POST /chat -- rather than GET with all of
+    # that in the URL. A native EventSource can only ever GET and can't set
+    # custom headers, which is exactly why this used to carry the session
+    # token (and, via DemoKeyMiddleware, the demo access key) as URL query
+    # params: both would land in server access logs, browser history, and
+    # any Referer header a query could leak through. The frontend
+    # (frontend/src/api/chat.ts) now drives this with fetch() + a streamed
+    # ReadableStream instead of EventSource, so it can send real headers.
+    if body.session_id is not None and not conversation_belongs_to_session(
+        body.session_id, x_session_token
+    ):
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    history = get_history(session_id) if session_id is not None else None
+    history = get_history(body.session_id) if body.session_id is not None else None
 
     def event_source():
         # See FENCE_MARKERS: a delta chunk could contain only part of a
@@ -127,12 +130,12 @@ def chat_stream(
 
         try:
             for item in generate_answer_stream(
-                query,
-                companies=companies,
-                fiscal_year=fiscal_year,
-                doc_type=doc_type,
+                body.query,
+                companies=body.companies,
+                fiscal_year=body.fiscal_year,
+                doc_type=body.doc_type,
                 history=history,
-                session_id=str(session_id) if session_id is not None else None,
+                session_id=str(body.session_id) if body.session_id is not None else None,
             ):
                 if isinstance(item, str):
                     if fence_found:
@@ -170,8 +173,8 @@ def chat_stream(
         if not fence_found and sent_len < len(buffer):
             yield f"data: {json.dumps({'delta': buffer[sent_len:]})}\n\n"
 
-        if session_id is not None and result is not None:
-            _persist_turn(session_id, query, result)
+        if body.session_id is not None and result is not None:
+            _persist_turn(body.session_id, body.query, result)
 
         # Deltas (and the turn, above) are already sent/persisted by this
         # point -- a response-shape mismatch here must still reach the
@@ -179,7 +182,7 @@ def chat_stream(
         # `done` event and leaving the request hanging with no signal that
         # generation actually succeeded.
         try:
-            payload = _to_chat_response(result, session_id).model_dump()
+            payload = _to_chat_response(result, body.session_id).model_dump()
         except Exception:
             error_payload = {"detail": "Failed to generate an answer"}
             yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"

@@ -10,7 +10,10 @@ dependencies = [
     "sqlalchemy>=2.0",
     "rank-bm25>=0.2",
     "sentence-transformers>=3.0",
-    "fastapi>=0.111",
+    # >=0.138 for app.frontend() (api/main.py) -- shipped in FastAPI 0.138.0
+    # (2026-06-20); anything older doesn't have this method at all and fails
+    # at import time with AttributeError, not a graceful degradation.
+    "fastapi>=0.138",
     "uvicorn[standard]>=0.30",
     "slowapi>=0.1.9",
     "python-multipart>=0.0.9",
