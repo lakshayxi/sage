@@ -271,3 +271,46 @@ above `MIN_RERANK_SCORE` for the Tesla query's embedding/BM25 signal.
 **How to reproduce:** `.venv/bin/sage-eval` (or `--limit N` for a faster/cheaper subset). Requires
 a live `GEMINI_API_KEY` and the corpus already ingested (`sage ingest`) — costs ~14 real Gemini
 chat calls per full run, so this is meant for occasional regression checks, not a tuning loop.
+
+## Update: explicit comparison rerank-gate correction (2026-07-20)
+
+The comparison candidate-balancing fix did not solve absolute-score collapse. The answer engine
+still inferred comparison mode from candidate metadata and filtered every company with
+`MIN_RERANK_SCORE=0.1`. Real-corpus measurements showed valid three-company revenue evidence below
+the cutoff for every company, while Apple FY2020 and NVIDIA Automotive distractors scored 0.94 and
+0.998. Lowering the global threshold was therefore rejected: the one-label BGE sigmoid output is
+bounded but not a calibrated probability or factual-answerability classifier.
+
+The implemented design:
+
+- Explicit comparison mode comes only from two or more normalized caller-selected companies.
+  Unfiltered mixed-company candidate pools and single-company requests retain the ordinary global
+  threshold path and cleaned-query retry.
+- Hybrid retrieval runs once with the original user query and its already-shared embedding. Each
+  requested company is reranked once over its existing candidate pool with a deterministic
+  company-local fact query. Up to `top_k` chunks are selected per company by rank, without an
+  absolute comparison cutoff; every requested group must be nonempty or the whole comparison
+  refuses. The original query remains unchanged for Gemini.
+- Reranking now returns scored copies instead of mutating `RetrievedChunk.score`. Exact and
+  semantic cache scope now includes `top_k`. Streaming and non-streaming continue through the same
+  retrieval-selection and deterministic scope-validation helpers.
+- Named fiscal years and singular `X segment` requests receive narrow lexical evidence checks
+  before generation. This blocks the observed FY2020 distractor and prevents NVIDIA's Automotive
+  end-market revenue from being mislabeled as a reportable segment.
+- The CLI now forwards its existing `--fiscal-year` and `--doc-type` flags. Gemini generation uses
+  temperature 0 for reproducible financial extraction/citation formatting.
+- The eval set now has 19 items, including the exact long revenue-ranking reproduction.
+  Comparison scoring requires every company/amount/source, recall checks gold evidence for all
+  companies, and `--id` supports targeted live reruns.
+
+**Real-corpus retrieval-only results:** all four target comparisons selected exactly five chunks
+per requested company and included every gold amount. Warm-process retrieval latency was
+8.20s (three-company revenue leader), 7.20s (net-income leader), 4.77s (two-company operating
+income), and 7.21s (full revenue ranking). Explicit Tesla/Amazon/FY20 filters selected zero chunks
+in 6.5–7.9ms. The exact live ranking completed in 7.63s (5.57s retrieval, 1.71s generation) and
+cited the correct Apple FY25, Microsoft FY25, and NVIDIA FY26 chunks.
+
+**Final validation:** 256 tests passed; Ruff lint/format and compileall passed. The final uncached
+live eval, rerun after adding company/amount association scoring, passed 19/19 in 86.7s with
+answerable gold recall 15/15, answerable citation mapping 15/15, and citation-text support 19/19
+(including clean no-citation refusals). Generated eval reports remain ignored runtime artifacts.

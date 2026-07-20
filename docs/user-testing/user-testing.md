@@ -59,3 +59,29 @@ Three real bugs surfaced this session, two fixed, one deliberately left open. Lo
 **Root cause:** with no company filter, retrieval runs one flat search over the whole corpus rather than a balanced per-company search, so results skew toward whichever company's chunks happen to match best. Selecting all three companies explicitly does activate the balanced per-company retrieval path (`_merge_balanced` in `sage/retrieval/retriever.py`), but even then, answer quality was weak — each company only gets a thin slice of the usual `top_k`, and there's no dedicated prompt for synthesizing a structured cross-company comparison.
 
 **Status:** not a bug — this is exactly the scope of task #9 (Compare Mode), which hasn't been built yet.
+
+## Follow-up — 2026-07-20: explicit comparison rerank gating fixed
+
+The historical notes above remain accurate for the 2026-07-18 build. Compare Mode was later
+built, but a second failure remained: it grouped candidates per company while applying the same
+absolute `MIN_RERANK_SCORE=0.1` to every group. The BGE reranker sigmoid output is not a
+calibrated answerability probability. In the real corpus, valid comparison evidence scored below
+0.1 while wrong-period and semantically adjacent unsupported requests scored as high as 0.94–0.998.
+
+The current path detects comparison mode only from the explicit caller-provided company list,
+reuses the original hybrid candidates, reranks each requested company with a deterministic
+company-local fact query, selects a bounded `top_k` per company by rank, and refuses if any
+requested company has no candidates. Single-company and unfiltered queries keep the old threshold
+behavior. Deterministic fiscal-year and named-segment checks also prevent the observed Apple
+FY2020 and NVIDIA Automotive end-market/segment substitutions before Gemini.
+
+Live verification on 2026-07-20:
+
+- Exact Apple/Microsoft/NVIDIA revenue ranking returned FY25 $416,161M, FY25 $281,724M, and FY26
+  $215,938M in the correct descending order with citations mapped to all three filings.
+- Retrieval-only checks found gold evidence for every company in all four target comparisons.
+- Explicit Tesla, Amazon, and FY20 scopes returned no evidence; query-only Apple FY2020 and NVIDIA
+  Automotive were rejected by deterministic scope validation with zero Gemini tokens.
+- Final uncached 19-item eval after company/amount association scoring: 19/19 passed in 86.7s;
+  answerable gold recall 15/15, answerable citation mapping 15/15, and citation-text support
+  19/19 (including clean no-citation refusals).
