@@ -8,6 +8,7 @@ from eval.scoring import (
     citation_text_supports_expected,
     extract_amounts_millions,
     keywords_match,
+    leader_match,
     numeric_match,
     refusal_detected,
     score_item,
@@ -52,6 +53,13 @@ def test_numeric_match_accepts_rounded_billion_phrasing_within_tolerance():
 def test_keywords_match_is_case_insensitive_and_requires_all():
     assert keywords_match("Compute & Networking led with $193,479M.", ["Compute"])
     assert not keywords_match("Graphics revenue was higher.", ["Compute"])
+
+
+def test_leader_match_requires_comparative_language_near_company():
+    assert leader_match("Apple reported the highest revenue of the three.", "Apple")
+    assert leader_match("The highest revenue was reported by Apple.", "Apple")
+    assert leader_match("Ranking from highest to lowest: 1. Apple", "Apple")
+    assert not leader_match("Apple and Microsoft were compared.", "Apple")
 
 
 def test_refusal_detected_matches_exact_gate_message():
@@ -131,6 +139,53 @@ def test_score_item_fails_when_no_citations_at_all():
     )
     result = score_item(item, "Apple's net sales were $416,161 million.", [])
     assert not result.grounded
+
+
+def test_comparison_scoring_requires_all_company_values_and_source_files():
+    item = EvalItem(
+        id="cross-revenue",
+        question="q",
+        companies=["Apple", "Microsoft"],
+        expected_company_amounts_millions={"Apple": 416_161.0, "Microsoft": 281_724.0},
+        expected_leader="Apple",
+    )
+    answer = (
+        "Apple reported the highest revenue at $416,161 million; "
+        "Microsoft reported $281,724 million."
+    )
+    result = score_item(
+        item,
+        answer,
+        ["Apple_FY25_filing.pdf"],
+        citation_texts=["Total net sales $ 416,161"],
+    )
+
+    assert result.correct
+    assert not result.grounded
+    assert not result.text_supported
+    assert not result.passed
+
+
+def test_comparison_scoring_passes_with_per_company_values_and_support():
+    item = EvalItem(
+        id="cross-revenue",
+        question="q",
+        companies=["Apple", "Microsoft"],
+        expected_company_amounts_millions={"Apple": 416_161.0, "Microsoft": 281_724.0},
+        expected_leader="Apple",
+    )
+    answer = (
+        "Apple reported the highest revenue at $416,161 million; "
+        "Microsoft reported $281,724 million."
+    )
+    result = score_item(
+        item,
+        answer,
+        ["Apple_FY25_filing.pdf", "Microsoft_FY25_filing.pdf"],
+        citation_texts=["Total net sales $ 416,161", "Total revenue $ 281,724"],
+    )
+
+    assert result.passed
 
 
 def test_score_item_unanswerable_passes_on_refusal_with_no_citations():
@@ -238,3 +293,43 @@ def test_score_item_unanswerable_flags_hallucinated_grounding_even_with_refusal_
     assert result.correct
     assert not result.grounded
     assert not result.passed
+
+
+def test_comparison_scoring_rejects_company_amount_swaps():
+    item = EvalItem(
+        id="comparison",
+        question="q",
+        companies=["Apple", "Microsoft"],
+        expected_company_amounts_millions={
+            "Apple": 416_161.0,
+            "Microsoft": 281_724.0,
+        },
+    )
+    result = score_item(
+        item,
+        "Apple reported $281,724 million. Microsoft reported $416,161 million.",
+        ["Apple_FY25_filing.pdf", "Microsoft_FY25_filing.pdf"],
+    )
+
+    assert not result.correct
+    assert not result.passed
+
+
+def test_comparison_scoring_associates_amount_below_markdown_company_heading():
+    item = EvalItem(
+        id="comparison",
+        question="q",
+        companies=["Apple", "Microsoft"],
+        expected_company_amounts_millions={
+            "Apple": 416_161.0,
+            "Microsoft": 281_724.0,
+        },
+    )
+    result = score_item(
+        item,
+        "### Apple\nFor FY2025, revenue was $416,161 million.\n\n"
+        "### Microsoft\nFor FY2025, revenue was $281,724 million.",
+        ["Apple_FY25_filing.pdf", "Microsoft_FY25_filing.pdf"],
+    )
+
+    assert result.correct

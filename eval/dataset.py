@@ -51,6 +51,16 @@ class EvalItem:
     # a dollar figure within `tolerance` (relative) of this value, in
     # millions. None if this item isn't a single-number lookup.
     expected_amount_millions: float | None = None
+    # Comparison correctness requires every company and figure, not merely
+    # the winner's name. Values are expressed in millions and are also used
+    # to verify per-filing retrieval/citation support.
+    expected_company_amounts_millions: dict[str, float] = field(default_factory=dict)
+    # Expected winner for a highest/higher comparison. Scoring requires the
+    # company name to appear near explicit comparative language.
+    expected_leader: str | None = None
+    # Answer-only period labels. These are not required to appear verbatim in
+    # raw citation text, where filings commonly spell FY25 as "2025".
+    expected_periods: list[str] = field(default_factory=list)
     tolerance: float = 0.02
     # Keyword correctness check: every string here must appear
     # (case-insensitive) in the answer. Used for qualitative/comparison
@@ -163,6 +173,12 @@ EVAL_ITEMS: list[EvalItem] = [
         expected_answer=(
             "Apple, at $416,161M, ahead of Microsoft ($281,724M) and NVIDIA ($215,938M)."
         ),
+        expected_company_amounts_millions={
+            "Apple": 416_161.0,
+            "Microsoft": 281_724.0,
+            "NVIDIA": 215_938.0,
+        },
+        expected_leader="Apple",
         expected_keywords=["Apple"],
     ),
     EvalItem(
@@ -177,6 +193,12 @@ EVAL_ITEMS: list[EvalItem] = [
             "this is the opposite ranking from total revenue, a real check that the model isn't "
             "just pattern-matching 'biggest company = biggest number'."
         ),
+        expected_company_amounts_millions={
+            "Apple": 112_010.0,
+            "Microsoft": 101_832.0,
+            "NVIDIA": 120_067.0,
+        },
+        expected_leader="NVIDIA",
         expected_keywords=["NVIDIA"],
     ),
     EvalItem(
@@ -190,7 +212,32 @@ EVAL_ITEMS: list[EvalItem] = [
             "NVIDIA, at $130,387M, versus Microsoft's $128,528M -- deliberately a close call "
             "(~1.4% apart) as a harder retrieval/generation precision stress test."
         ),
+        expected_company_amounts_millions={
+            "Microsoft": 128_528.0,
+            "NVIDIA": 130_387.0,
+        },
+        expected_leader="NVIDIA",
         expected_keywords=["NVIDIA"],
+    ),
+    EvalItem(
+        id="cross-revenue-full-ranking",
+        question=(
+            "Compare total annual revenue for Apple, Microsoft, and NVIDIA using each company's "
+            "ingested fiscal-year filing. State each fiscal year and amount in millions, then "
+            "rank them from highest to lowest."
+        ),
+        companies=["Apple", "Microsoft", "NVIDIA"],
+        expected_answer=(
+            "Apple FY25 $416,161M, Microsoft FY25 $281,724M, NVIDIA FY26 $215,938M; "
+            "ranking: Apple, Microsoft, NVIDIA."
+        ),
+        expected_company_amounts_millions={
+            "Apple": 416_161.0,
+            "Microsoft": 281_724.0,
+            "NVIDIA": 215_938.0,
+        },
+        expected_leader="Apple",
+        expected_periods=["FY25", "FY26"],
     ),
     # --- Deliberately out-of-corpus (grounding/refusal check: the corpus only
     # has Apple, Microsoft, and NVIDIA -- these ask about companies with no
