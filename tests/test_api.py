@@ -84,6 +84,41 @@ def test_chat_non_streaming(monkeypatch, client):
     assert body["session_id"] is None
 
 
+def test_chat_passes_validated_top_k_to_both_generation_paths(monkeypatch, client):
+    captured = []
+
+    def fake_generate_answer(*args, **kwargs):
+        captured.append(("chat", kwargs["top_k"]))
+        return _fake_answer()
+
+    def fake_generate_answer_stream(*args, **kwargs):
+        captured.append(("stream", kwargs["top_k"]))
+        yield _fake_answer(answer_text="done")
+
+    monkeypatch.setattr(chat_routes, "generate_answer", fake_generate_answer)
+    monkeypatch.setattr(chat_routes, "generate_answer_stream", fake_generate_answer_stream)
+
+    assert client.post("/chat", json={"query": "q", "top_k": 3}).status_code == 200
+    with client.stream("POST", "/chat/stream", json={"query": "q", "top_k": 4}) as response:
+        assert response.status_code == 200
+
+    assert captured == [("chat", 3), ("stream", 4)]
+
+
+@pytest.mark.parametrize("top_k", [0, True, 3.0, settings.RERANK_CANDIDATE_K + 1])
+def test_chat_rejects_top_k_outside_engine_budget(top_k, client):
+    response = client.post("/chat", json={"query": "q", "top_k": top_k})
+
+    assert response.status_code == 422
+
+
+def test_chat_rejects_unbounded_or_blank_company_scope(client):
+    too_many = [f"Company {i}" for i in range(settings.MAX_COMPARISON_COMPANIES + 1)]
+
+    assert client.post("/chat", json={"query": "q", "companies": too_many}).status_code == 422
+    assert client.post("/chat", json={"query": "q", "companies": [" "]}).status_code == 422
+
+
 def test_chat_with_session_id_loads_history_and_persists_turn(monkeypatch, client):
     conversation_id, token = conversations.create_conversation(title="Apple margins")
     captured = {}

@@ -71,10 +71,37 @@ COMPARISON_SUPERLATIVE_RE = re.compile(
 COMPARISON_RANKING_CLAUSE_RE = re.compile(
     r"[,;]?\s*(?:then\s+)?rank(?:ing)?\b.*\Z", re.IGNORECASE | re.DOTALL
 )
-REQUESTED_FISCAL_YEAR_RE = re.compile(r"\bfiscal\s+year\s+(?:fy)?(20\d{2}|\d{2})\b", re.I)
-REQUESTED_POSSESSIVE_COMPANY_RE = re.compile(r"\b([A-Z][A-Za-z0-9.&-]*)['’]s\b")
-REQUESTED_SEGMENT_RE = re.compile(r"\b([a-z][a-z0-9&-]*)\s+(?:business\s+)?segment\b", re.I)
+COMPARISON_METRIC_RE = re.compile(
+    r"\b(?:total(?:\s+annual)?\s+revenue|net\s+sales|net\s+income|operating\s+income|"
+    r"r\s*&\s*d\s+expense|research\s+and\s+development\s+expense|revenue)\b",
+    re.IGNORECASE,
+)
+REQUESTED_FISCAL_YEAR_RE = re.compile(
+    r"\b(?:(?:fiscal[\s-]+year)\s*(?:fy\s*)?|fy\s*)(20\d{2}|\d{2})\b", re.IGNORECASE
+)
+REQUESTED_POSSESSIVE_COMPANY_RE = re.compile(
+    r"\b("
+    r"[A-Z][A-Za-z0-9.&-]*"
+    r"(?:\s+(?:(?:of|the|and|&)\s+)?[A-Z][A-Za-z0-9.&-]*){0,5}"
+    r")['’]s\b"
+)
+REQUESTED_SEGMENT_RE = re.compile(
+    r"\b([a-z][a-z0-9&-]*(?:\s+(?:&|and)\s+[a-z][a-z0-9&-]*)?)\s+"
+    r"(?:(?:business|operating|reportable)\s+)?segment\b",
+    re.IGNORECASE,
+)
 GENERIC_SEGMENT_WORDS = {"a", "any", "business", "operating", "reportable", "the", "what", "which"}
+GENERIC_POSSESSIVE_WORDS = {
+    "board",
+    "business",
+    "ceo",
+    "cfo",
+    "company",
+    "customer",
+    "filing",
+    "management",
+    "segment",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -349,7 +376,11 @@ def _is_explicit_comparison(companies: list[str] | None) -> bool:
 
 
 def _validate_top_k(top_k: int) -> None:
-    if not 1 <= top_k <= settings.RERANK_CANDIDATE_K:
+    if (
+        isinstance(top_k, bool)
+        or not isinstance(top_k, int)
+        or not 1 <= top_k <= settings.RERANK_CANDIDATE_K
+    ):
         raise ValueError(f"top_k must be between 1 and {settings.RERANK_CANDIDATE_K}")
 
 
@@ -374,6 +405,16 @@ def _company_local_rerank_query(query: str, company: str, requested_companies: l
         # A mixed-metric or free-form comparison cannot be decomposed safely
         # with string surgery. Preserve the original cross-encoder query.
         return query
+    # The templates below localize one company-independent metric. Mixed or
+    # company-specific metrics need semantic association that string surgery
+    # cannot preserve safely, so keep the original query for those shapes.
+    if len(COMPARISON_METRIC_RE.findall(stripped)) != 1:
+        return query
+    possessive_mentions = [
+        match.group(1).casefold() for match in REQUESTED_POSSESSIVE_COMPANY_RE.finditer(stripped)
+    ]
+    if any(name in possessive_mentions for name in (c.casefold() for c in requested_companies)):
+        return query
 
     focus = COMPARISON_LEAD_RE.sub("", stripped, count=1)
     focus = re.sub(r"^\s*compare\b\s*", "", focus, count=1, flags=re.IGNORECASE)
@@ -381,6 +422,10 @@ def _company_local_rerank_query(query: str, company: str, requested_companies: l
         focus = re.sub(rf"\b{re.escape(requested_company)}\b", "", focus, flags=re.IGNORECASE)
     focus = COMPARISON_REPORTING_VERB_RE.sub("", focus, count=1)
     focus = COMPARISON_SUPERLATIVE_RE.sub("", focus, count=1)
+    # "which company was higher" is not one of the reporting-verb templates;
+    # falling back is safer than emitting "What was Apple's was higher ...".
+    if re.match(r"^\s*was\b", focus, re.IGNORECASE):
+        return query
     focus = re.sub(r"\beach company['’]s\b", "its", focus, flags=re.IGNORECASE)
     focus = re.sub(r"\bfor\s*(?:(?:,\s*)|(?:and\s*))*?(?=using\b)", "", focus, flags=re.IGNORECASE)
     focus = re.sub(r"\busing\s+its\b", "in its", focus, flags=re.IGNORECASE)
@@ -409,10 +454,15 @@ def _select_explicit_comparison_evidence(
     top_score = 0.0
     chunks: list[RetrievedChunk] = []
     for company in requested_companies:
+        company_key = company.casefold()
         seen_ids: set[int] = set()
         company_candidates = []
         for candidate in candidates:
-            if candidate.company == company and candidate.chunk_id not in seen_ids:
+            if (
+                candidate.company
+                and candidate.company.casefold() == company_key
+                and candidate.chunk_id not in seen_ids
+            ):
                 seen_ids.add(candidate.chunk_id)
                 company_candidates.append(candidate)
         if not company_candidates:
@@ -480,7 +530,14 @@ def _unsupported_scope_reason(
     requested_companies = _normalize_companies(companies)
     evidence_groups = (
         [
-            (company, [chunk for chunk in chunks if chunk.company == company])
+            (
+                company,
+                [
+                    chunk
+                    for chunk in chunks
+                    if chunk.company and chunk.company.casefold() == company.casefold()
+                ],
+            )
             for company in requested_companies
         ]
         if len(requested_companies) >= 2
@@ -491,43 +548,64 @@ def _unsupported_scope_reason(
     # company absent from every selected chunk is deterministically outside
     # the evidence scope. This is deliberately narrow, not general-purpose
     # company entity recognition.
-    if len(requested_companies) < 2:
-        evidence_companies = {chunk.company.lower() for chunk in chunks if chunk.company}
+    if not requested_companies:
+        evidence_companies = {chunk.company.casefold() for chunk in chunks if chunk.company}
         for company_match in REQUESTED_POSSESSIVE_COMPANY_RE.finditer(query):
-            named_company = company_match.group(1)
-            if named_company.lower() not in evidence_companies:
+            named_company = company_match.group(1).strip()
+            words = named_company.split()
+            if named_company.casefold() in GENERIC_POSSESSIVE_WORDS or any(
+                word.casefold() in GENERIC_POSSESSIVE_WORDS for word in words
+            ):
+                continue
+            if named_company.casefold() not in evidence_companies:
                 return f"requested_company_not_in_evidence:{named_company}"
 
-    year_matches = list(REQUESTED_FISCAL_YEAR_RE.finditer(query))
-    # Multiple years may be independently scoped ("Apple FY25 vs NVIDIA
-    # FY26"); leave that association to generation rather than requiring
-    # every year in every company group.
-    for year_match in year_matches if len(year_matches) == 1 else []:
-        year = year_match.group(1)
-        full_year = f"20{year}" if len(year) == 2 else year
+    requested_years = list(
+        dict.fromkeys(
+            f"20{match.group(1)}" if len(match.group(1)) == 2 else match.group(1)
+            for match in REQUESTED_FISCAL_YEAR_RE.finditer(query)
+        )
+    )
+
+    def group_supports_year(group: list[RetrievedChunk], full_year: str) -> bool:
         short_year = full_year[-2:]
+        metadata_years = {
+            re.sub(r"[^a-z0-9]", "", str(chunk.fiscal_year).casefold())
+            for chunk in group
+            if chunk.fiscal_year
+        }
+        if metadata_years:
+            return bool(
+                {short_year, full_year, f"fy{short_year}", f"fy{full_year}"} & metadata_years
+            )
+        combined_text = " ".join(chunk.text for chunk in group).casefold()
+        return full_year in combined_text or f"fy{short_year}" in combined_text
+
+    if len(requested_years) == 1:
+        full_year = requested_years[0]
         for company, group in evidence_groups:
-            combined_text = " ".join(chunk.text for chunk in group).lower()
-            metadata_years = {
-                str(chunk.fiscal_year).lower() for chunk in group if chunk.fiscal_year
-            }
-            if (
-                full_year.lower() not in combined_text
-                and f"fy{short_year}".lower() not in combined_text
-                and f"fy{short_year}".lower() not in metadata_years
-                and f"fy{full_year}".lower() not in metadata_years
-            ):
+            if not group_supports_year(group, full_year):
                 suffix = f":{company}" if company else ""
                 return f"requested_fiscal_year_not_in_evidence:{full_year}{suffix}"
+    elif requested_years:
+        # Multiple years may be independently scoped ("Apple FY25 vs NVIDIA
+        # FY26"). Require every requested year somewhere in the total evidence
+        # without incorrectly requiring every year in every company group.
+        all_evidence = [chunk for _, group in evidence_groups for chunk in group]
+        for full_year in requested_years:
+            if not group_supports_year(all_evidence, full_year):
+                return f"requested_fiscal_year_not_in_evidence:{full_year}"
 
-    segment_matches = list(REQUESTED_SEGMENT_RE.finditer(query))
-    for segment_match in segment_matches if len(segment_matches) == 1 else []:
-        label = segment_match.group(1).lower()
+    requested_segments = list(
+        dict.fromkeys(match.group(1).casefold() for match in REQUESTED_SEGMENT_RE.finditer(query))
+    )
+    segment_groups = evidence_groups if len(requested_segments) == 1 else [(None, chunks)]
+    for label in requested_segments:
         meaningful_words = [word for word in label.split() if word not in GENERIC_SEGMENT_WORDS]
         if not meaningful_words:
             continue
-        for company, group in evidence_groups:
-            combined_text = " ".join(chunk.text for chunk in group).lower()
+        for company, group in segment_groups:
+            combined_text = " ".join(chunk.text for chunk in group).casefold()
             if f"{label} segment" not in combined_text:
                 suffix = f":{company}" if company else ""
                 return f"requested_segment_not_in_evidence:{label}{suffix}"

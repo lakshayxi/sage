@@ -78,6 +78,11 @@ DEFAULT_TOP_K = 5
 # total -- see sage/retrieval/retriever.py.
 RERANK_CANDIDATE_K = 30
 RERANKER_MODEL = "BAAI/bge-reranker-base"
+# Public comparison scope is intentionally bounded before the per-company
+# retrieval loop: total work/context otherwise scales as companies × the
+# candidate/selection budgets.
+MAX_COMPARISON_COMPANIES = 10
+MAX_COMPANY_FILTER_LENGTH = 200
 # Minimum cross-encoder score for ordinary single-company and unfiltered
 # queries. The sigmoid output is bounded but not a calibrated probability or
 # factual-answerability classifier: Sage's measured answerable/unanswerable

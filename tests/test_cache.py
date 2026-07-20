@@ -33,6 +33,21 @@ def test_make_cache_key_is_order_independent_for_companies():
     assert key1 == key2
 
 
+def test_make_cache_key_normalizes_company_case_whitespace_and_duplicates():
+    canonical = cache.make_cache_key(
+        "compare capex", ["Apple", "Microsoft"], None, None, "gemini-2.5-flash"
+    )
+    variant = cache.make_cache_key(
+        "compare capex",
+        [" microsoft ", "APPLE", "apple", ""],
+        None,
+        None,
+        "gemini-2.5-flash",
+    )
+
+    assert canonical == variant
+
+
 def test_make_cache_key_is_sensitive_to_filters_and_model():
     base = cache.make_cache_key(
         "What are Apple margins?", ["Apple"], "FY24", None, "gemini-2.5-flash"
@@ -286,6 +301,42 @@ def test_semantic_cache_respects_comparison_vs_single_company(monkeypatch):
     )
 
     miss = cache.get_semantic_cached(near_query, ["Apple"], None, None, "gemini-2.5-flash")
+
+    assert miss is None
+
+
+def test_semantic_cache_respects_top_k_scope(monkeypatch):
+    base_query = "semantic top-k base"
+    near_query = "semantic top-k near"
+    monkeypatch.setattr(
+        cache, "embed_query", _fake_embedder({base_query: [1.0, 0.0], near_query: [0.99, 0.01]})
+    )
+
+    key = cache.make_cache_key(
+        base_query, ["Apple", "Microsoft"], None, None, "gemini-2.5-flash", top_k=5
+    )
+    cache.store_cached(
+        key,
+        base_query,
+        "gemini-2.5-flash",
+        "Five chunks per company.",
+        [],
+        [],
+        1,
+        1,
+        2,
+        companies=["Apple", "Microsoft"],
+        top_k=5,
+    )
+
+    miss = cache.get_semantic_cached(
+        near_query,
+        ["Apple", "Microsoft"],
+        None,
+        None,
+        "gemini-2.5-flash",
+        top_k=3,
+    )
 
     assert miss is None
 

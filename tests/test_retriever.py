@@ -1,5 +1,6 @@
 import pytest
 
+from config import settings
 from sage.db.database import get_session
 from sage.db.models import Chunk, Document
 from sage.retrieval import retriever
@@ -156,12 +157,29 @@ def test_retrieve_hybrid_respects_single_company_filter(monkeypatch, sample_chun
 
 
 def test_normalize_companies_dedupes_and_drops_falsy():
-    assert retriever._normalize_companies(["Apple", "", None, "Apple", "Microsoft"]) == [
+    assert retriever._normalize_companies(
+        [" Apple ", "", None, "apple", "Microsoft", " MICROSOFT "]
+    ) == [
         "Apple",
         "Microsoft",
     ]
     assert retriever._normalize_companies(None) == []
     assert retriever._normalize_companies([]) == []
+    assert retriever._normalize_companies([" ", "\t"]) == []
+
+
+def test_canonicalize_company_filters_uses_corpus_spelling(sample_chunks):
+    assert retriever._canonicalize_company_filters(["apple-test", "Unknown Co"]) == [
+        "Apple-Test",
+        "Unknown Co",
+    ]
+
+
+def test_retrieve_hybrid_rejects_unbounded_company_scope():
+    companies = [f"Company {i}" for i in range(settings.MAX_COMPARISON_COMPANIES + 1)]
+
+    with pytest.raises(ValueError, match="companies must contain at most"):
+        retriever.retrieve_hybrid("revenue", companies=companies)
 
 
 # --- Multi-company merge: new logic not present in the reference project. ---

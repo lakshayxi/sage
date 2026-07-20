@@ -448,8 +448,11 @@ def test_generate_answer_retries_with_cleaned_query_when_first_attempt_is_empty(
     def fake_rerank(query, candidates, top_k):
         calls["rerank"] += 1
         if calls["rerank"] == 1:
-            return [_fake_chunk(score=settings.MIN_RERANK_SCORE - 0.01)]
-        return [_fake_chunk(chunk_id=99, score=0.9)]
+            chunk = _fake_chunk(score=settings.MIN_RERANK_SCORE - 0.01)
+        else:
+            chunk = _fake_chunk(chunk_id=99, score=0.9)
+        chunk.fiscal_year = "FY25"
+        return [chunk]
 
     monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
     monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
@@ -672,6 +675,28 @@ def test_company_local_rerank_query_preserves_unsupported_comparison_shapes(quer
     assert (
         answer_engine._company_local_rerank_query(query, "Apple", ["Apple", "Microsoft"]) == query
     )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Between Apple and Microsoft, which company was higher in total revenue?",
+        "Among Apple and Microsoft, which company had higher revenue and lower net income?",
+        (
+            "Compare Apple's total revenue and Microsoft's net income using each company's "
+            "fiscal-year filing."
+        ),
+    ],
+)
+def test_company_local_rerank_query_preserves_unsafe_supported_frames(query):
+    assert (
+        answer_engine._company_local_rerank_query(query, "Apple", ["Apple", "Microsoft"]) == query
+    )
+
+
+def test_company_scope_normalization_does_not_activate_comparison_for_variants():
+    assert answer_engine._is_explicit_comparison([" Apple ", "apple", "", " "]) is False
+    assert answer_engine._is_explicit_comparison(["Apple", " microsoft "]) is True
 
 
 def test_explicit_three_company_comparison_keeps_low_score_evidence_and_generates(monkeypatch):
@@ -958,6 +983,10 @@ def test_top_k_must_be_within_candidate_budget():
     with pytest.raises(ValueError, match="top_k must be between"):
         answer_engine.generate_answer("query", top_k=-1, client=client)
     with pytest.raises(ValueError, match="top_k must be between"):
+        answer_engine.generate_answer("query", top_k=True, client=client)
+    with pytest.raises(ValueError, match="top_k must be between"):
+        answer_engine.generate_answer("query", top_k=3.0, client=client)
+    with pytest.raises(ValueError, match="top_k must be between"):
         list(
             answer_engine.generate_answer_stream(
                 "query", top_k=settings.RERANK_CANDIDATE_K + 1, client=client
@@ -983,6 +1012,29 @@ def test_scope_validation_accepts_an_explicitly_named_segment():
     assert reason is None
 
 
+@pytest.mark.parametrize("modifier", ["reportable", "operating", "business"])
+def test_scope_validation_rejects_missing_segment_with_financial_modifier(modifier):
+    chunks = [_fake_chunk(company="NVIDIA")]
+    chunks[0].text = "Automotive products contributed to consolidated revenue."
+
+    reason = answer_engine._unsupported_scope_reason(
+        f"How much revenue did the Automotive {modifier} segment generate?", chunks, ["NVIDIA"]
+    )
+
+    assert reason == "requested_segment_not_in_evidence:automotive"
+
+
+def test_scope_validation_accepts_multi_word_segment_label():
+    chunks = [_fake_chunk(company="NVIDIA")]
+    chunks[0].text = "The Compute & Networking segment reported revenue."
+
+    reason = answer_engine._unsupported_scope_reason(
+        "What revenue did the Compute & Networking segment report?", chunks, ["NVIDIA"]
+    )
+
+    assert reason is None
+
+
 def test_scope_validation_rejects_period_missing_from_text_and_metadata():
     chunks = [_fake_chunk(company="Apple")]
     chunks[0].text = "Apple reported fiscal year 2025 net sales."
@@ -993,6 +1045,68 @@ def test_scope_validation_rejects_period_missing_from_text_and_metadata():
     )
 
     assert reason == "requested_fiscal_year_not_in_evidence:2020"
+
+
+@pytest.mark.parametrize("year_label", ["FY20", "FY2020", "fiscal-year FY2020"])
+def test_scope_validation_rejects_standalone_wrong_fiscal_year_variants(year_label):
+    chunks = [_fake_chunk(company="Apple")]
+    chunks[0].text = "Apple also discusses trends that began in 2020."
+    chunks[0].fiscal_year = "FY25"
+
+    reason = answer_engine._unsupported_scope_reason(
+        f"What were Apple's net sales in {year_label}?", chunks, ["Apple"]
+    )
+
+    assert reason == "requested_fiscal_year_not_in_evidence:2020"
+
+
+def test_scope_validation_requires_every_year_mentioned_in_a_multi_year_query():
+    chunks = [_fake_chunk(company="Apple")]
+    chunks[0].text = "Apple reported fiscal year 2025 net sales."
+    chunks[0].fiscal_year = "FY25"
+
+    reason = answer_engine._unsupported_scope_reason(
+        "Compare Apple's fiscal year 2020 revenue with its fiscal year 2021 revenue.",
+        chunks,
+        ["Apple"],
+    )
+
+    assert reason == "requested_fiscal_year_not_in_evidence:2020"
+
+
+@pytest.mark.parametrize(
+    ("query", "company"),
+    [
+        ("What was Bank of America's revenue?", "Bank of America"),
+        ("What was Berkshire Hathaway’s revenue?", "Berkshire Hathaway"),
+        ("What was The Walt Disney Company's revenue?", "The Walt Disney Company"),
+    ],
+)
+def test_scope_validation_accepts_multi_word_possessive_company(query, company):
+    chunks = [_fake_chunk(company=company)]
+    chunks[0].text = f"{company} reported revenue."
+
+    assert answer_engine._unsupported_scope_reason(query, chunks) is None
+
+
+def test_filtered_scope_does_not_treat_ordinary_possessive_as_another_company():
+    chunks = [_fake_chunk(company="Microsoft")]
+    chunks[0].text = "Azure revenue is included in Microsoft's filing."
+
+    reason = answer_engine._unsupported_scope_reason(
+        "What did Microsoft's Azure's revenue include?", chunks, ["Microsoft"]
+    )
+
+    assert reason is None
+
+
+def test_unfiltered_scope_does_not_treat_generic_possessive_as_a_company():
+    chunks = [_fake_chunk(company="Apple")]
+    chunks[0].text = "The CEO's compensation is described in the filing."
+
+    assert (
+        answer_engine._unsupported_scope_reason("What was the CEO's compensation?", chunks) is None
+    )
 
 
 def test_scope_validation_defers_mixed_company_year_association_to_generation():

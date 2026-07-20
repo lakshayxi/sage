@@ -42,7 +42,7 @@ _UNSET = "__unset__"
 def _normalize_companies_for_key(companies: list[str] | None) -> list[str]:
     if not companies:
         return []
-    return sorted({c for c in companies if c})
+    return sorted({c.strip().casefold() for c in companies if c and c.strip()})
 
 
 def make_cache_key(
