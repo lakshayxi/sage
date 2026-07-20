@@ -30,6 +30,7 @@ def test_chat_splits_system_message_into_system_instruction():
 
     call = fake_client._generate.last_call
     assert call["config"].system_instruction == "You are a financial assistant."
+    assert call["config"].temperature == 0.0
     # Only the non-system turn should remain in `contents`.
     assert len(call["contents"]) == 1
     assert call["contents"][0].role == "user"

@@ -15,8 +15,8 @@ Most "chat with your PDF" tools optimize for a demo, not for trust. Sage is buil
 
 ## Features
 
-- **Grounded, cited answers** — every factual claim resolves to a specific ingested chunk (company / fiscal year / doc type / page), with a hard relevance gate: if nothing retrieved clears the cross-encoder's relevance threshold, the LLM is never even called. Citation numbers resolve deterministically by position against the chunks actually shown to the model — a citation's identity is never taken from the model's own (possibly wrong) `chunk_id` echo.
-- **Compare Mode** — ask about multiple companies in one query; each company gets its own independent retrieval and reranking budget instead of sharing one pool, and the prompt auto-switches to a structured per-company-then-comparison format.
+- **Grounded, cited answers** — every factual claim resolves to a specific ingested chunk (company / fiscal year / doc type / page). Ordinary queries retain a hard cross-encoder gate; explicit comparisons use bounded per-company rank selection plus requested-scope completeness checks. Citation numbers resolve deterministically by position against the chunks actually shown to the model — a citation's identity is never taken from the model's own (possibly wrong) `chunk_id` echo.
+- **Compare Mode** — explicitly select multiple companies and each gets its own independent retrieval and reranking budget instead of sharing one pool. Reranking uses a deterministic company-local fact query while Gemini still receives the original comparison wording, and the prompt switches to a structured per-company-then-comparison format.
 - **Hybrid retrieval** — BM25 keyword search + vector similarity, fused via reciprocal rank fusion, narrowed by a `BAAI/bge-reranker-base` cross-encoder. A query is embedded exactly once per request and reused across the semantic cache check and every company's retrieval call in a comparison query, not re-embedded per company.
 - **Fully local embeddings** — `sentence-transformers` (`BAAI/bge-small-en-v1.5`) runs in-process, so retrieval has zero API cost and zero quota risk; only generation calls out to Gemini.
 - **Live streaming answers** via `fetch()` + a streamed `ReadableStream` (not `EventSource`), so the query, filters, and session token travel in a POST body/headers instead of a URL query string — with a fence-buffered stream so the model's internal citation-JSON block never leaks into what the user sees typing.
@@ -24,7 +24,7 @@ Most "chat with your PDF" tools optimize for a demo, not for trust. Sage is buil
 - **Two-layer query cache** — exact-match (SQLite) checked first, semantic (embedding-similarity, Chroma-backed) on a miss, both TTL-expiring; an expired row is refreshed in place by the next generated answer rather than blocking future writes forever.
 - **Page-exact chunking** — a chunk never spans a page boundary and an oversized paragraph is split into bounded, overlapping windows, so a citation's page number is always exactly right, never just "the page the chunk started on."
 - **Recoverable, idempotent ingestion** — a checksum-based dedup skips re-ingesting identical file content, and a failure partway through cleans up any Chroma vectors already written so nothing is orphaned across the two separate (non-transactional) stores.
-- **Retrieval-quality eval harness** (`sage-eval`) — an 18-item hand-curated Q&A set (including multi-turn follow-ups and distractor-adjacent unanswerable items) run against the real ingested corpus with caching disabled, scored on numeric correctness, citation grounding, citation-text support, recall@k, and citation-number mapping validity — not just "did retrieval return something."
+- **Retrieval-quality eval harness** (`sage-eval`) — a 19-item hand-curated Q&A set (including full multi-company figures/ranking, multi-turn follow-ups, and distractor-adjacent unanswerable items) run against the real ingested corpus with caching disabled, scored on numeric correctness, per-company citation grounding/text support, gold-evidence recall, and citation-number mapping validity — not just "did retrieval return something."
 - **Public-deployment guardrails** — a rate-limited, non-secret demo-access deterrent (not a real auth boundary — see Design decisions), and uploads disabled by default (`ALLOW_UPLOADS=false`) with streamed/bounded/content-validated writes when enabled, so a public demo can't be turned into an open PDF-processing service.
 
 ## Architecture
@@ -82,9 +82,9 @@ sequenceDiagram
     else cache miss
         API->>Ret: hybrid retrieve (BM25 + vector, per company if 2+)
         Ret-->>API: candidate chunks
-        API->>RR: rerank (own top_k budget per company)
-        RR-->>API: reranked, score-filtered chunks
-        alt nothing clears MIN_RERANK_SCORE
+        API->>RR: rerank (ordinary gate or explicit per-company rank budget)
+        RR-->>API: bounded, scope-validated chunks
+        alt no ordinary evidence or requested comparison group/scope missing
             API-->>U: deterministic refusal, zero LLM calls
         else
             API->>LLM: generate (comparison prompt if 2+ companies)
@@ -139,7 +139,7 @@ sage/
 │   ├── reviews/            # Dated pre-deploy code + security review logs
 │   └── user-testing/        # Dated live-testing session logs
 ├── eval/                  # Hand-curated Q&A eval harness (sage-eval)
-└── tests/                 # 224 tests, no live Gemini required
+└── tests/                 # 290 tests, no live Gemini required
 ```
 
 ## API reference
@@ -153,6 +153,12 @@ sage/
 | `GET` | `/conversations/{id}` | Full message history for one conversation (session-scoped) |
 | `GET` | `/documents` | List ingested filings |
 | `POST` | `/documents/upload` | Upload a PDF (multipart) — 403s when `ALLOW_UPLOADS=false` |
+
+Both chat endpoints accept `top_k` in the JSON body (default `5`, allowed
+range `1`–`30`). For explicit comparisons it means the final chunk budget per
+normalized company; for single-company and unfiltered requests it is the
+global final chunk budget. Company filters are trimmed, case-insensitively
+deduplicated/canonicalized against corpus metadata, and limited to 10 entries.
 
 Real `POST /chat` response shape (trimmed):
 
@@ -269,7 +275,7 @@ Running the test suite (no live Gemini/network required):
 
 **Queries get BGE's asymmetric instruction prefix; indexed passages don't.** `BAAI/bge-small-en-v1.5` is documented to benefit from a `"Represent this sentence for searching relevant passages: "` prefix on the query side only — passages stay unprefixed so already-indexed Chroma vectors remain valid without a re-ingest. `sage/embed/local_embedder.py`'s `embed_query()` applies the prefix and is used by retrieval and the semantic cache; ingestion still calls the unprefixed `embed_text()`/`embed_texts()`.
 
-**Compare Mode gives each company its own retrieval and reranking budget, not a shared one.** An earlier version reranked all companies' candidates together against one shared `top_k`, which let whichever company's chunks scored marginally higher crowd out the others — a 3-company query could come back with real data for one company and "insufficient context" for the rest, even when the data existed. Each company now gets an independently reranked, independently budgeted slice of context.
+**Compare Mode gives each explicitly requested company its own retrieval and reranking budget, not a shared one.** An earlier version reranked all companies' candidates together against one shared `top_k`, then a later version grouped candidates but still filtered every company through one absolute cutoff. Full comparison wording can collapse valid `BAAI/bge-reranker-base` scores below 0.1, and its sigmoid outputs are not calibrated probabilities. Compare Mode now reuses original-query hybrid candidates, reranks once per requested company with a deterministic company-local fact query for recognized comparison shapes (otherwise the original query), keeps up to `top_k` chunks per company by rank, and refuses the whole comparison if any requested group is absent. Single-company and unfiltered behavior remains globally threshold-gated. `top_k` is validated from 1 through the configured 30-candidate rerank budget in the engine, CLI, and HTTP API. Company filters are trimmed, case-insensitively deduplicated, resolved to corpus metadata casing, and capped at 10 entries before per-company retrieval work begins.
 
 **Session isolation via an unguessable token, not a login system.** Conversations are scoped to a server-issued `secrets.token_urlsafe(32)` stored client-side, not a user account — enough to stop one visitor reading another's history on a public demo, without building auth for a single-operator portfolio project.
 
@@ -288,7 +294,9 @@ Running the test suite (no live Gemini/network required):
 - **Free Hugging Face Spaces have ephemeral storage** — conversations and cache writes on the public deployment don't survive a Space restart.
 - **The reranker model isn't baked into the deployment image** — it downloads from the HF Hub lazily on first use, so the first query after a cold start is noticeably slower than the rest.
 - **No OCR fallback** — PDF text extraction (PyMuPDF) is direct-text-layer only; scanned/image-only filings would extract little or no text.
-- **`MIN_RERANK_SCORE` (0.1) is still an empirically-probed starting point, not exhaustively tuned** — carried over from a sibling project's corpus, but no longer untouched: a real false-rejection case (an on-topic question with a trailing evaluative clause, e.g. "...were they good?", scored far below plain phrasing of the same question) has been fixed with a targeted one-time retry in `answer_engine.py`, and the eval harness's first real run against Sage's own corpus passed 13/14.
+- **`MIN_RERANK_SCORE` (0.1) remains a heuristic for ordinary single-company/unfiltered queries** — it is not a calibrated answerability probability. Vague phrasing can still false-reject, while wrong-period or semantically adjacent nonexistent facts can score highly. Explicit comparison score collapse is handled separately; globally lowering the threshold was rejected because answerable and unanswerable score distributions overlap.
+- **Explicit comparison context scales as `requested companies × top_k`** — the default three-company request can send 15 chunks (the validated revenue-ranking prompt used 10,602 input tokens), although the caller scope is capped at 10 normalized companies. Company-local query decomposition is deterministic and intentionally limited to single-metric measured “Among…”, “Between…”, and filing-oriented “Compare…using each company’s…” forms; other or multi-metric grammar safely retains the original rerank query and may rank less well.
+- **Deterministic company/period/segment validation is deliberately narrow and lexical** — it handles corpus-canonical company casing, common possessive company names, explicit `FYxx`/`FYxxxx` and “fiscal year” forms, and singular `X [reportable|operating|business] segment` requests, but it is not a general entity linker or schema/ontology engine. Ticker aliases and category synonyms remain unsupported and may be conservatively refused.
 - **Uploads are synchronous, in-request ingestion** — there's no background job queue, so `MAX_UPLOAD_PAGES` exists specifically to bound how long a single upload request can take; a deployment expecting much larger filings than the 500-page default should raise it deliberately, aware that ingestion latency scales with it.
 
 ## Security notes
@@ -305,10 +313,10 @@ Real evidence, not just "tests pass":
 
 - **`docs/reviews/2026-07-18-pre-deploy-review.md`** — a structured, multi-agent code + security review of the full codebase before first deployment; 10 confirmed findings (including a conversation-history access-control gap), all fixed and independently re-verified.
 - **`docs/user-testing/user-testing.md`** — bugs surfaced by hand-driving the live app, including a real SSE stream-truncation bug and a config bug where `GEMINI_API_KEY` silently never loaded at runtime.
-- **`eval/` — an 18-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus — dollar-figure tolerance, citation-grounding, *and* citation-text-supports-the-answer checks (not just filename), plus recall@k, rerank-gate, and citation-number-mapping metrics reported per run (not an LLM judge — see `eval/scoring.py`'s docstring for why). Includes multi-turn follow-up items and unanswerable items with an in-corpus semantically-similar distractor. Always run with `use_cache=False` so a rerun re-tests generation instead of replaying a cached answer. Historical result on the original 14-item set (before the multi-turn/distractor items were added): **13/14 passed**; the one failure was a genuine bug (a declined-to-answer response still carrying a resolved citation), since fixed and re-verified — see `docs/llm-engineer-work-log.md`.
+- **`eval/` — a 19-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus. Numeric comparisons associate each expected figure with its company and require per-company source support; inline citation markers are also checked against the company whose amount they support. The exact long three-company ranking reproduction is included. The final 2026-07-20 uncached Python 3.11 live run passed **19/19** in 155.7s with answerable gold recall **15/15**, citation mapping/text support/inline company association **19/19**, and 85,616 total tokens (including clean zero-token refusals). Use repeatable `--id ITEM_ID` for targeted reruns.
 - **CI** (`.github/workflows/ci.yml`) — runs `pytest tests/`, `ruff check`/`format --check`, and the frontend's `oxlint` + `tsc` typecheck + `vite build` on every push/PR. Does not run `eval/run_eval.py` itself (live Gemini calls, real per-run cost, no offline mode).
 
-224 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
+290 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
 
 ## Deployment
 

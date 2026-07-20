@@ -76,6 +76,7 @@ def chat(
     try:
         result = generate_answer(
             body.query,
+            top_k=body.top_k,
             companies=body.companies,
             fiscal_year=body.fiscal_year,
             doc_type=body.doc_type,
@@ -131,6 +132,7 @@ def chat_stream(
         try:
             for item in generate_answer_stream(
                 body.query,
+                top_k=body.top_k,
                 companies=body.companies,
                 fiscal_year=body.fiscal_year,
                 doc_type=body.doc_type,

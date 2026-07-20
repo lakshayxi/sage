@@ -1,3 +1,6 @@
+import pytest
+
+from config import settings
 from sage import cli
 from sage.db import conversations
 from sage.generation.answer_engine import AnswerResult
@@ -47,17 +50,95 @@ def test_cmd_ask_non_streaming_prints_answer_and_citations(monkeypatch, capsys):
 def test_cmd_ask_passes_multiple_companies_through(monkeypatch):
     captured = {}
 
-    def fake_generate_answer(query, top_k, companies=None, history=None):
+    def fake_generate_answer(
+        query,
+        top_k,
+        companies=None,
+        fiscal_year=None,
+        doc_type=None,
+        history=None,
+    ):
         captured["companies"] = companies
+        captured["fiscal_year"] = fiscal_year
+        captured["doc_type"] = doc_type
         return _fake_result()
 
     monkeypatch.setattr(cli, "generate_answer", fake_generate_answer)
 
     parser = cli.build_parser()
-    args = parser.parse_args(["ask", "compare", "--company", "Apple", "--company", "Microsoft"])
+    args = parser.parse_args(
+        [
+            "ask",
+            "compare",
+            "--company",
+            "Apple",
+            "--company",
+            "Microsoft",
+            "--fiscal-year",
+            "FY25",
+            "--doc-type",
+            "filing",
+        ]
+    )
     cli.cmd_ask(args)
 
     assert captured["companies"] == ["Apple", "Microsoft"]
+    assert captured["fiscal_year"] == "FY25"
+    assert captured["doc_type"] == "filing"
+
+
+def test_cmd_ask_streaming_passes_scope_filters_through(monkeypatch):
+    captured = {}
+
+    def fake_generate_answer_stream(
+        query,
+        top_k,
+        companies=None,
+        fiscal_year=None,
+        doc_type=None,
+        history=None,
+    ):
+        captured.update(
+            companies=companies,
+            fiscal_year=fiscal_year,
+            doc_type=doc_type,
+        )
+        yield _fake_result()
+
+    monkeypatch.setattr(cli, "generate_answer_stream", fake_generate_answer_stream)
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "ask",
+            "compare",
+            "--stream",
+            "--company",
+            "Apple",
+            "--company",
+            "Microsoft",
+            "--fiscal-year",
+            "FY25",
+            "--doc-type",
+            "filing",
+        ]
+    )
+    cli.cmd_ask(args)
+
+    assert captured == {
+        "companies": ["Apple", "Microsoft"],
+        "fiscal_year": "FY25",
+        "doc_type": "filing",
+    }
+
+
+def test_ask_parser_rejects_top_k_outside_candidate_budget():
+    parser = cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["ask", "query", "--top-k", "0"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["ask", "query", "--top-k", str(settings.RERANK_CANDIDATE_K + 1)])
 
 
 def test_cmd_ask_new_conversation_persists_turns(monkeypatch):
@@ -83,7 +164,14 @@ def test_cmd_ask_continues_existing_conversation_with_history(monkeypatch):
 
     captured = {}
 
-    def fake_generate_answer(query, top_k, companies=None, history=None):
+    def fake_generate_answer(
+        query,
+        top_k,
+        companies=None,
+        fiscal_year=None,
+        doc_type=None,
+        history=None,
+    ):
         captured["history"] = history
         return _fake_result("second answer")
 

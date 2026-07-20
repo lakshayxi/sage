@@ -2,8 +2,9 @@
 schema_version -- bump it on any breaking response-shape change."""
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints
 
 from config import settings
 
@@ -12,9 +13,27 @@ SCHEMA_VERSION = 1
 
 class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=settings.MAX_QUERY_LENGTH)
-    companies: list[str] | None = None
+    companies: (
+        list[
+            Annotated[
+                str,
+                StringConstraints(
+                    strip_whitespace=True,
+                    min_length=1,
+                    max_length=settings.MAX_COMPANY_FILTER_LENGTH,
+                ),
+            ]
+        ]
+        | None
+    ) = Field(default=None, max_length=settings.MAX_COMPARISON_COMPANIES)
     fiscal_year: str | None = None
     doc_type: str | None = None
+    top_k: int = Field(
+        default=settings.DEFAULT_TOP_K,
+        ge=1,
+        le=settings.RERANK_CANDIDATE_K,
+        strict=True,
+    )
     session_id: int | None = None  # conversation id to continue, if any
 
 

@@ -69,6 +69,7 @@ _REFUSAL_RE = re.compile("|".join(_REFUSAL_PATTERNS), re.IGNORECASE)
 # 5]"), page numbers, or the fiscal year itself ("2025").
 _NUMBER = r"[\d]{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+|\d+"
 _AMOUNT_RE = re.compile(rf"(\$\s*)?({_NUMBER})\s*(billion|bn|million|mn)?", re.IGNORECASE)
+_CITATION_MARKER_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def extract_amounts_millions(text: str) -> list[float]:
@@ -110,6 +111,16 @@ def keywords_match(text: str, keywords: list[str]) -> bool:
     return all(keyword.lower() in lowered for keyword in keywords)
 
 
+def leader_match(text: str, leader: str) -> bool:
+    """Whether `leader` is tied to explicit comparative language."""
+    escaped = re.escape(leader)
+    comparative = r"(?:highest|higher|largest|leader|ranking|rank(?:ed|s)?\s+(?:first|#?1))"
+    return bool(
+        re.search(rf"\b{escaped}\b.{{0,120}}\b{comparative}\b", text, re.I | re.S)
+        or re.search(rf"\b{comparative}\b.{{0,120}}\b{escaped}\b", text, re.I | re.S)
+    )
+
+
 def refusal_detected(text: str) -> bool:
     return text.strip() == _EXACT_REFUSAL_TEXT or bool(_REFUSAL_RE.search(text))
 
@@ -122,7 +133,7 @@ def allowed_filenames_for(item: EvalItem) -> set[str]:
     return set(COMPANY_FILENAMES.values())
 
 
-def _raw_source_text_contains_amount(text: str, expected_millions: float) -> bool:
+def source_text_contains_amount(text: str, expected_millions: float) -> bool:
     """Whether raw *source* text (a cited chunk, not the model's generated
     prose) states the expected figure directly in millions.
 
@@ -151,7 +162,11 @@ def _raw_source_text_contains_amount(text: str, expected_millions: float) -> boo
     return any(candidate in text for candidate in candidates)
 
 
-def citation_text_supports_expected(item: EvalItem, citation_texts: list[str]) -> bool:
+def citation_text_supports_expected(
+    item: EvalItem,
+    citation_texts: list[str],
+    citation_filenames: list[str] | None = None,
+) -> bool:
     """Whether the *content* of the cited chunks actually contains/supports
     the expected value -- stronger than `grounded`'s filename-only check,
     which would still pass if the model cited a real, allowed-filename
@@ -161,7 +176,7 @@ def citation_text_supports_expected(item: EvalItem, citation_texts: list[str]) -
 
     Tries both the prose-oriented `numeric_match` (in case a cited chunk
     happens to be narrative MD&A text that does spell out "million") and
-    `_raw_source_text_contains_amount` (the common case: a financial
+    `source_text_contains_amount` (the common case: a financial
     statement table stating its scale only in a caption) -- either is
     accepted as support.
     """
@@ -171,10 +186,27 @@ def citation_text_supports_expected(item: EvalItem, citation_texts: list[str]) -
         return False
     combined = " ".join(citation_texts)
     checks = []
+    if item.expected_company_amounts_millions:
+        if citation_filenames is None:
+            checks.extend(
+                source_text_contains_amount(combined, expected)
+                for expected in item.expected_company_amounts_millions.values()
+            )
+        else:
+            for company, expected in item.expected_company_amounts_millions.items():
+                filename = COMPANY_FILENAMES.get(company)
+                company_text = " ".join(
+                    text
+                    for cited_filename, text in zip(citation_filenames, citation_texts, strict=True)
+                    if cited_filename == filename
+                )
+                checks.append(
+                    bool(company_text) and source_text_contains_amount(company_text, expected)
+                )
     if item.expected_amount_millions is not None:
         checks.append(
             numeric_match(combined, item.expected_amount_millions, item.tolerance)
-            or _raw_source_text_contains_amount(combined, item.expected_amount_millions)
+            or source_text_contains_amount(combined, item.expected_amount_millions)
         )
     if item.expected_keywords:
         checks.append(keywords_match(combined, item.expected_keywords))
@@ -183,16 +215,78 @@ def citation_text_supports_expected(item: EvalItem, citation_texts: list[str]) -
     return all(checks)
 
 
+def citation_company_associations_valid(
+    item: EvalItem,
+    answer_text: str,
+    citation_filenames: list[str],
+    citation_texts: list[str],
+    citation_numbers: list[int],
+) -> bool:
+    """Tie each comparison claim's inline markers to that company's evidence.
+
+    Aggregate checks can prove that an answer contains the right amounts and
+    that its citation set contains the right source chunks while still
+    missing a damaging swap: Apple's amount marked with Microsoft's citation
+    and vice versa. This validates the association within each bounded company
+    section, using the resolved citation number rather than list position.
+    """
+    if not item.expected_company_amounts_millions:
+        return True
+    if not (len(citation_filenames) == len(citation_texts) == len(citation_numbers)):
+        return False
+
+    source_by_number = {
+        number: (filename, text)
+        for number, filename, text in zip(
+            citation_numbers, citation_filenames, citation_texts, strict=True
+        )
+    }
+    company_names = list(item.expected_company_amounts_millions)
+    lowered_answer = answer_text.lower()
+    for company, expected in item.expected_company_amounts_millions.items():
+        company_start = lowered_answer.find(company.lower())
+        if company_start < 0:
+            return False
+        company_end = min(len(answer_text), company_start + 600)
+        for other_company in company_names:
+            if other_company == company:
+                continue
+            position = lowered_answer.find(other_company.lower(), company_start + len(company))
+            if position >= 0:
+                company_end = min(company_end, position)
+
+        marker_numbers = {
+            int(number)
+            for marker in _CITATION_MARKER_RE.finditer(answer_text[company_start:company_end])
+            for number in marker.group(1).split(",")
+        }
+        expected_filename = COMPANY_FILENAMES.get(company)
+        if not any(
+            number in source_by_number
+            and source_by_number[number][0] == expected_filename
+            and source_text_contains_amount(source_by_number[number][1], expected)
+            for number in marker_numbers
+        ):
+            return False
+    return True
+
+
 @dataclass
 class ScoreResult:
     correct: bool
     grounded: bool
     text_supported: bool
     detail: str
+    citation_association_valid: bool = True
 
     @property
     def passed(self) -> bool:
-        return self.correct and self.grounded and self.text_supported
+        return (
+            self.correct
+            and self.grounded
+            and self.text_supported
+            and self.citation_association_valid
+        )
 
 
 def score_item(
@@ -200,6 +294,7 @@ def score_item(
     answer_text: str,
     citation_filenames: list[str],
     citation_texts: list[str] | None = None,
+    citation_numbers: list[int] | None = None,
 ) -> ScoreResult:
     """`citation_texts`, if given, is the text of each resolved citation
     (`Citation.text`) in the same order as `citation_filenames` -- used for
@@ -221,19 +316,75 @@ def score_item(
         checks.append(numeric_match(answer_text, item.expected_amount_millions, item.tolerance))
     if item.expected_keywords:
         checks.append(keywords_match(answer_text, item.expected_keywords))
+    if item.expected_company_amounts_millions:
+        company_names = list(item.expected_company_amounts_millions)
+        for company, expected in item.expected_company_amounts_millions.items():
+            # Associate each figure with its company rather than accepting the
+            # right bag of names and numbers in the wrong pairings. Bound the
+            # company section at the next named company; markdown headings put
+            # the amount on the following line, so a newline is not a boundary.
+            company_start = answer_text.lower().find(company.lower())
+            if company_start < 0:
+                checks.append(False)
+                continue
+            company_end = min(len(answer_text), company_start + 600)
+            for other_company in company_names:
+                if other_company == company:
+                    continue
+                position = answer_text.lower().find(
+                    other_company.lower(), company_start + len(company)
+                )
+                if position >= 0:
+                    company_end = min(company_end, position)
+            checks.append(
+                numeric_match(answer_text[company_start:company_end], expected, item.tolerance)
+            )
+    if item.expected_leader:
+        checks.append(leader_match(answer_text, item.expected_leader))
+    if item.expected_periods:
+        checks.append(keywords_match(answer_text, item.expected_periods))
     correct = all(checks) if checks else False
 
     allowed = allowed_filenames_for(item)
-    grounded = len(citation_filenames) > 0 and all(f in allowed for f in citation_filenames)
+    required = (
+        {COMPANY_FILENAMES[c] for c in item.expected_company_amounts_millions}
+        if item.expected_company_amounts_millions
+        else set()
+    )
+    grounded = (
+        len(citation_filenames) > 0
+        and all(f in allowed for f in citation_filenames)
+        and required.issubset(set(citation_filenames))
+    )
     text_supported = (
-        True if citation_texts is None else citation_text_supports_expected(item, citation_texts)
+        True
+        if citation_texts is None
+        else citation_text_supports_expected(item, citation_texts, citation_filenames)
+    )
+    citation_association_valid = (
+        True
+        if citation_texts is None or citation_numbers is None
+        else citation_company_associations_valid(
+            item,
+            answer_text,
+            citation_filenames,
+            citation_texts,
+            citation_numbers,
+        )
     )
     detail = (
         f"correct={correct} (expected_amount_millions={item.expected_amount_millions}, "
+        f"expected_company_amounts_millions={item.expected_company_amounts_millions}, "
+        f"expected_leader={item.expected_leader}, expected_periods={item.expected_periods}, "
         f"expected_keywords={item.expected_keywords}), "
         f"grounded={grounded} (citations={citation_filenames}, allowed={sorted(allowed)}), "
-        f"text_supported={text_supported}"
+        f"text_supported={text_supported}, "
+        f"citation_association_valid={citation_association_valid}"
     )
     return ScoreResult(
-        correct=correct, grounded=grounded, text_supported=text_supported, detail=detail
+        correct=correct,
+        grounded=grounded,
+        text_supported=text_supported,
+        detail=detail,
+        citation_association_valid=citation_association_valid,
     )

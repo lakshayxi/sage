@@ -1,6 +1,6 @@
-"""Exact-match query cache: hash(query + metadata filters + model) -> cached
-answer, plus a semantic (embedding-similarity) fallback cache checked on an
-exact-match miss.
+"""Exact-match query cache: hash(query + metadata filters + model + top_k) ->
+cached answer, plus a semantic (embedding-similarity) fallback cache checked
+on an exact-match miss.
 
 A cache hit avoids a live Gemini *chat* call entirely (the semantic-cache
 lookup itself still costs one local embedding call, which is free -- see
@@ -42,7 +42,7 @@ _UNSET = "__unset__"
 def _normalize_companies_for_key(companies: list[str] | None) -> list[str]:
     if not companies:
         return []
-    return sorted({c for c in companies if c})
+    return sorted({c.strip().casefold() for c in companies if c and c.strip()})
 
 
 def make_cache_key(
@@ -51,13 +51,9 @@ def make_cache_key(
     fiscal_year: str | None,
     doc_type: str | None,
     model: str,
+    top_k: int = settings.DEFAULT_TOP_K,
 ) -> str:
-    """Hash (query + metadata filters + model) into a cache key.
-
-    `top_k` is deliberately not part of the key -- two requests differing
-    only in top_k share a cache entry, matching the reference project's
-    documented tradeoff.
-    """
+    """Hash the query and every answer-shaping retrieval parameter."""
     payload = json.dumps(
         {
             "query": query.strip(),
@@ -65,6 +61,7 @@ def make_cache_key(
             "fiscal_year": fiscal_year,
             "doc_type": doc_type,
             "model": model,
+            "top_k": top_k,
         },
         sort_keys=True,
     )
@@ -91,7 +88,11 @@ def get_cached(cache_key: str) -> QueryCache | None:
 
 
 def _semantic_metadata(
-    companies: list[str] | None, fiscal_year: str | None, doc_type: str | None, model: str
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+    model: str,
+    top_k: int,
 ) -> dict:
     normalized = _normalize_companies_for_key(companies)
     return {
@@ -99,11 +100,16 @@ def _semantic_metadata(
         "companies": json.dumps(normalized) if normalized else _UNSET,
         "fiscal_year": fiscal_year or _UNSET,
         "doc_type": doc_type or _UNSET,
+        "top_k": top_k,
     }
 
 
 def _semantic_where(
-    companies: list[str] | None, fiscal_year: str | None, doc_type: str | None, model: str
+    companies: list[str] | None,
+    fiscal_year: str | None,
+    doc_type: str | None,
+    model: str,
+    top_k: int,
 ) -> dict:
     normalized = _normalize_companies_for_key(companies)
     return {
@@ -112,6 +118,7 @@ def _semantic_where(
             {"companies": json.dumps(normalized) if normalized else _UNSET},
             {"fiscal_year": fiscal_year or _UNSET},
             {"doc_type": doc_type or _UNSET},
+            {"top_k": top_k},
         ]
     }
 
@@ -123,12 +130,13 @@ def get_semantic_cached(
     doc_type: str | None,
     model: str,
     query_embedding: list[float] | None = None,
+    top_k: int = settings.DEFAULT_TOP_K,
 ) -> QueryCache | None:
     """Embedding-similarity fallback, checked on an exact-match miss.
 
     Finds the nearest previously-cached query, restricted to the same
-    companies/fiscal_year/doc_type/model as the exact-match key, and returns
-    its QueryCache row if within SEMANTIC_CACHE_THRESHOLD squared-L2
+    companies/fiscal_year/doc_type/model/top_k as the exact-match key, and
+    returns its QueryCache row if within SEMANTIC_CACHE_THRESHOLD squared-L2
     distance. Delegates to `get_cached` for the final lookup, so an expired
     underlying row is treated as a miss here too.
 
@@ -138,7 +146,7 @@ def get_semantic_cached(
     embedding the identical query text twice.
     """
     embedding = query_embedding if query_embedding is not None else embed_query(query_text)
-    where = _semantic_where(companies, fiscal_year, doc_type, model)
+    where = _semantic_where(companies, fiscal_year, doc_type, model, top_k)
     result = store.query(
         embedding, top_k=1, where=where, collection_name=settings.CHROMA_QUERY_CACHE_COLLECTION
     )
@@ -163,6 +171,7 @@ def store_cached(
     fiscal_year: str | None = None,
     doc_type: str | None = None,
     query_embedding: list[float] | None = None,
+    top_k: int = settings.DEFAULT_TOP_K,
 ) -> None:
     """Insert a fresh cache entry, or refresh an existing *expired* one in
     place -- a still-fresh row (written by a concurrent request that beat
@@ -228,6 +237,6 @@ def store_cached(
         ids=[cache_key],
         embeddings=[embedding],
         documents=[query_text],
-        metadatas=[_semantic_metadata(companies, fiscal_year, doc_type, model)],
+        metadatas=[_semantic_metadata(companies, fiscal_year, doc_type, model, top_k)],
         collection_name=settings.CHROMA_QUERY_CACHE_COLLECTION,
     )

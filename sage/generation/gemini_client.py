@@ -30,6 +30,11 @@ response (dropped fence, truncated JSON) -- only well-formed output was
 observed in this session's live calls, so those fallbacks (carried over
 from the reference project's llama3.1-specific observations) remain
 unverified against genuine Gemini failure output.
+
+Follow-up (2026-07-20): an uncached 19-item eval observed two
+otherwise-correct answers omit their citation fence under default sampling.
+Generation now uses temperature 0; the targeted rerun and final full
+19-item run both emitted valid, fully grounded citations.
 """
 
 from collections.abc import Iterator
@@ -108,7 +113,11 @@ class GeminiChatClient:
     def _config(self, system: str | None) -> types.GenerateContentConfig | None:
         if system is None:
             return None
-        return types.GenerateContentConfig(system_instruction=system)
+        # Financial extraction/citation formatting should be reproducible,
+        # not creatively sampled. A zero temperature also reduces observed
+        # runs where an otherwise-correct answer omitted the required
+        # citation fence.
+        return types.GenerateContentConfig(system_instruction=system, temperature=0.0)
 
     def chat(self, messages: list[dict]) -> ChatResult:
         client = self._client_or_default()

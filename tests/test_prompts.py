@@ -41,6 +41,16 @@ def test_build_messages_selects_plain_system_prompt_for_single_company():
     messages = prompts.build_messages("what were margins", [_chunk(1, "Apple")])
 
     assert messages[0]["content"] == prompts.SYSTEM_PROMPT
+    assert "never substitute a nearby period" in messages[0]["content"]
+    assert "reportable segment" in messages[0]["content"]
+
+
+def test_explicit_prompt_mode_overrides_incidental_multi_company_chunks():
+    chunks = [_chunk(1, "Apple"), _chunk(2, "Microsoft")]
+
+    messages = prompts.build_messages("unfiltered query", chunks, comparison_mode=False)
+
+    assert messages[0]["content"] == prompts.SYSTEM_PROMPT
 
 
 def test_build_messages_inserts_history_between_system_and_new_user_message():

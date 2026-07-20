@@ -2,12 +2,11 @@
 
 Two system prompts: a single-company `SYSTEM_PROMPT` (ported from the
 reference project, same citation-fence contract) and a
-`COMPARISON_SYSTEM_PROMPT` used whenever the retrieved context spans more
-than one company. The comparison variant is a real product requirement, not
-internal plumbing -- "Compare Apple vs Microsoft's capex" reads badly as a
-single blended paragraph with interleaved, ambiguous citations, so it
-explicitly instructs the model to structure the answer per-company before
-comparing.
+`COMPARISON_SYSTEM_PROMPT` used for explicit caller-selected multi-company
+scope. The comparison variant is a real product requirement, not internal
+plumbing -- "Compare Apple vs Microsoft's capex" reads badly as a single
+blended paragraph with interleaved, ambiguous citations, so it explicitly
+instructs the model to structure the answer per-company before comparing.
 
 NOTE on live validation (2026-07-17, real GEMINI_API_KEY, model=gemini-flash-latest):
 both SYSTEM_PROMPT and COMPARISON_SYSTEM_PROMPT were exercised live and both
@@ -27,6 +26,11 @@ from sage.retrieval.retriever import RetrievedChunk
 SYSTEM_PROMPT = (
     "You are a financial research assistant. Answer ONLY using the numbered "
     "context chunks below. If the context is insufficient, say so explicitly. "
+    "Match the requested company, fiscal period, and accounting category exactly: "
+    "never substitute a nearby period or reinterpret a market platform, product "
+    "category, or other business label as a reportable segment. If that exact "
+    "scope is unsupported, refuse the requested figure and do not cite unrelated "
+    "or merely similar context; return an empty citations array. "
     "Cite every factual claim with [n] referencing the chunk number. Context "
     "chunks are prefixed with Company / Fiscal Year / Doc Type / Page."
 )
@@ -43,7 +47,11 @@ COMPARISON_SYSTEM_PROMPT = (
     "unattributed sentence -- every factual claim must be citeable to "
     "exactly one company's chunk via [n]. If the context is insufficient for "
     "one or more companies, say so explicitly for each affected company "
-    "rather than omitting it silently."
+    "rather than omitting it silently. Match each requested fiscal period and "
+    "accounting category exactly: never substitute a nearby period or reinterpret "
+    "a market platform, product category, or other business label as a reportable "
+    "segment. For an unsupported scope, refuse that requested figure and do not "
+    "cite unrelated or merely similar context."
 )
 
 CITATION_FORMAT_INSTRUCTION = (
@@ -84,18 +92,24 @@ def build_user_message(query: str, chunks: list[RetrievedChunk]) -> str:
 
 
 def build_messages(
-    query: str, chunks: list[RetrievedChunk], history: list[dict] | None = None
+    query: str,
+    chunks: list[RetrievedChunk],
+    history: list[dict] | None = None,
+    comparison_mode: bool | None = None,
 ) -> list[dict]:
     """Build the full role/content message list for a generation call.
 
-    Picks `COMPARISON_SYSTEM_PROMPT` automatically when `chunks` spans more
-    than one company; `history` (prior turns from an ongoing conversation, if
-    any) is inserted between the system prompt and the new user message so a
-    multi-turn session keeps conversational continuity. Retrieval itself is
-    still always run fresh off just the latest query -- only the LLM sees the
-    full history.
+    `comparison_mode` lets the answer engine select the prompt from explicit
+    caller scope rather than incidental candidate metadata. None preserves
+    the auto-detection behavior for direct callers. `history` (prior turns
+    from an ongoing conversation, if any) is inserted between the system
+    prompt and the new user message so a multi-turn session keeps
+    conversational continuity. Retrieval itself is still always run fresh
+    off just the latest query -- only the LLM sees the full history.
     """
-    system_prompt = COMPARISON_SYSTEM_PROMPT if is_comparison(chunks) else SYSTEM_PROMPT
+    if comparison_mode is None:
+        comparison_mode = is_comparison(chunks)
+    system_prompt = COMPARISON_SYSTEM_PROMPT if comparison_mode else SYSTEM_PROMPT
     messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(history)

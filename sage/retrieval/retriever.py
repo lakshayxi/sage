@@ -50,16 +50,57 @@ class RetrievedChunk:
 
 
 def _normalize_companies(companies: list[str] | None) -> list[str]:
-    """Dedupe (order-preserving) and drop falsy entries."""
+    """Trim, case-insensitively dedupe, and drop empty entries."""
     if not companies:
         return []
     seen: set[str] = set()
     normalized = []
     for c in companies:
-        if c and c not in seen:
-            seen.add(c)
-            normalized.append(c)
+        if not c:
+            continue
+        stripped = c.strip()
+        key = stripped.casefold()
+        if stripped and key not in seen:
+            seen.add(key)
+            normalized.append(stripped)
     return normalized
+
+
+def _canonicalize_company_filters(companies: list[str]) -> list[str]:
+    """Resolve caller casing to the exact company spelling stored in the corpus.
+
+    Chroma metadata filters are exact-match only. Without this small lookup,
+    ``companies=["nvidia"]`` misses an ingested ``NVIDIA`` document even
+    though comparison detection and cache scope correctly treat casing as an
+    identity detail rather than a second company.
+    """
+    if not companies:
+        return []
+    session = get_session()
+    try:
+        stored = [
+            company
+            for (company,) in session.query(Document.company)
+            .filter(Document.company.is_not(None))
+            .distinct()
+            .all()
+            if company
+        ]
+    finally:
+        session.close()
+    by_key = {company.casefold(): company for company in stored}
+    return [by_key.get(company.casefold(), company) for company in companies]
+
+
+def _validate_company_filters(companies: list[str]) -> None:
+    if len(companies) > settings.MAX_COMPARISON_COMPANIES:
+        raise ValueError(
+            f"companies must contain at most {settings.MAX_COMPARISON_COMPANIES} unique entries"
+        )
+    if any(len(company) > settings.MAX_COMPANY_FILTER_LENGTH for company in companies):
+        raise ValueError(
+            f"company names must be at most {settings.MAX_COMPANY_FILTER_LENGTH} characters"
+        )
 
 
 def _build_where(company: str | None, fiscal_year: str | None, doc_type: str | None) -> dict | None:
@@ -233,10 +274,12 @@ def retrieve_hybrid(
     computing an identical one again. Computed here (once, not per company)
     when omitted.
     """
+    normalized = _normalize_companies(companies)
+    _validate_company_filters(normalized)
+    normalized = _canonicalize_company_filters(normalized)
+
     if query_embedding is None:
         query_embedding = embed_query(query_text)
-
-    normalized = _normalize_companies(companies)
 
     if len(normalized) <= 1:
         company = normalized[0] if normalized else None

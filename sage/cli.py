@@ -62,7 +62,12 @@ def cmd_ask(args: argparse.Namespace) -> None:
     if args.stream:
         result = None
         for item in generate_answer_stream(
-            args.text, top_k=args.top_k, companies=companies, history=history
+            args.text,
+            top_k=args.top_k,
+            companies=companies,
+            fiscal_year=args.fiscal_year,
+            doc_type=args.doc_type,
+            history=history,
         ):
             if isinstance(item, str):
                 print(item, end="", flush=True)
@@ -73,7 +78,14 @@ def cmd_ask(args: argparse.Namespace) -> None:
                 _print_citations(result.citations)
                 _print_stats(result)
     else:
-        result = generate_answer(args.text, top_k=args.top_k, companies=companies, history=history)
+        result = generate_answer(
+            args.text,
+            top_k=args.top_k,
+            companies=companies,
+            fiscal_year=args.fiscal_year,
+            doc_type=args.doc_type,
+            history=history,
+        )
         print(result.answer_text)
         print()
         _print_citations(result.citations)
@@ -143,7 +155,12 @@ def build_parser() -> argparse.ArgumentParser:
         "ask", help="Retrieve + generate a grounded, cited answer (repeat --company to compare)"
     )
     ask_parser.add_argument("text")
-    ask_parser.add_argument("--top-k", type=int, default=settings.DEFAULT_TOP_K)
+    ask_parser.add_argument(
+        "--top-k",
+        type=int,
+        choices=range(1, settings.RERANK_CANDIDATE_K + 1),
+        default=settings.DEFAULT_TOP_K,
+    )
     ask_parser.add_argument(
         "--company",
         action="append",
