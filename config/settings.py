@@ -78,16 +78,14 @@ DEFAULT_TOP_K = 5
 # total -- see sage/retrieval/retriever.py.
 RERANK_CANDIDATE_K = 30
 RERANKER_MODEL = "BAAI/bge-reranker-base"
-# Minimum cross-encoder relevance score (sigmoid-applied, so in [0, 1]) for a
-# reranked chunk to be used to answer from. Chunks below this are dropped
-# before prompting; if none remain, the pipeline refuses to answer rather
-# than generating from irrelevant context. Reused unchanged from the
-# reference project's empirically-grounded value: manual probing there found
-# genuinely relevant (query, chunk) pairs scoring 0.59-0.9998 versus
-# off-topic pairs scoring 0.0000-0.0021 against the same BAAI/bge-reranker-base
-# model -- 0.1 sits in the gap between those two clusters. The reasoning
-# transfers directly since the reranker model and its sigmoid scoring are
-# unchanged; still worth re-validating against Sage's own corpus over time.
+# Minimum cross-encoder score for ordinary single-company and unfiltered
+# queries. The sigmoid output is bounded but not a calibrated probability or
+# factual-answerability classifier: Sage's measured answerable/unanswerable
+# distributions overlap heavily. Explicit comparisons therefore use balanced
+# company-local rank selection instead of this cutoff; see answer_engine.py.
+# Do not lower this globally to fix a comparison false negative, because
+# wrong-period and semantically-adjacent nonexistent facts can score far above
+# it while valid comparison evidence can score below it.
 MIN_RERANK_SCORE = 0.1
 
 # --- Chroma ---

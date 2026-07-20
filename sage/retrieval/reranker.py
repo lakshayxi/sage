@@ -6,13 +6,15 @@ the query against each candidate's full text jointly, which is more accurate
 but too slow to run over the whole corpus -- hence running it only over the
 candidates already narrowed by `retrieve_hybrid`.
 
-Kept identical to the reference project (same model, same sigmoid-scored
-[0, 1] range, same `MIN_RERANK_SCORE` gate applied by the caller) -- this
-step operates purely on already-retrieved chunk text and is unaffected by
-Sage's multi-company retrieval change or its Gemini-only generation layer.
+The model's one-label output is sigmoid-bounded, but that number is not a
+calibrated relevance probability or factual-answerability classifier.
+Ordinary queries may still apply `MIN_RERANK_SCORE` in the answer engine;
+explicit comparisons use per-company rank because their full comparison
+wording collapses otherwise-relevant absolute scores.
 """
 
 import threading
+from dataclasses import replace
 
 from sentence_transformers import CrossEncoder
 
@@ -39,9 +41,12 @@ def _get_model() -> CrossEncoder:
 def rerank(query_text: str, candidates: list[RetrievedChunk], top_k: int) -> list[RetrievedChunk]:
     """Score each candidate against the query and return the top_k, best first.
 
-    `score` on the returned chunks is overwritten with the cross-encoder's
-    relevance score (higher is better), replacing whatever hybrid RRF score
-    it carried in from retrieval.
+    Returned chunks are copies whose `score` contains the cross-encoder
+    relevance score (higher is better). The input candidates retain their
+    hybrid RRF scores. Keeping reranking non-mutating matters when callers
+    compare query variants: a second pass must not overwrite scores held by
+    the first pass or leave a mixed pool where only the previous top_k
+    objects carry cross-encoder scores.
     """
     if not candidates:
         return []
@@ -52,6 +57,5 @@ def rerank(query_text: str, candidates: list[RetrievedChunk], top_k: int) -> lis
 
     reranked = []
     for chunk, score in ranked[:top_k]:
-        chunk.score = float(score)
-        reranked.append(chunk)
+        reranked.append(replace(chunk, score=float(score)))
     return reranked

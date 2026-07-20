@@ -24,7 +24,7 @@ from sage.generation.cost import estimate_cost_usd
 from sage.generation.gemini_client import GeminiChatClient, StreamDone, StreamToken
 from sage.generation.prompts import build_messages
 from sage.retrieval.reranker import rerank
-from sage.retrieval.retriever import RetrievedChunk, retrieve_hybrid
+from sage.retrieval.retriever import RetrievedChunk, _normalize_companies, retrieve_hybrid
 
 CITATION_MARKER_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
@@ -37,9 +37,8 @@ CITATIONS_UNFENCED_RE = re.compile(r"\n?citations\s*\n(\[.*\])\s*\Z", re.DOTALL 
 UNCLOSED_CITATIONS_RE = re.compile(r"```citations|\n?citations\s*\n\[", re.IGNORECASE)
 BARE_TRAILING_FENCE_RE = re.compile(r"\n*```\s*\Z")
 
-# Returned when reranking finds nothing above settings.MIN_RERANK_SCORE -- the
-# LLM is never called in this case, so there's zero risk of it hallucinating
-# an answer from irrelevant context (and zero Gemini quota spent on it).
+# Returned when ordinary reranking or deterministic scope validation finds no
+# usable evidence. The LLM is never called in this case.
 NO_RELEVANT_CONTEXT_ANSWER = (
     "I don't have information in the ingested documents that's relevant to this question."
 )
@@ -53,6 +52,28 @@ NO_RELEVANT_CONTEXT_ANSWER = (
 TRAILING_EVALUATIVE_CLAUSE_RE = re.compile(
     r"[.,]\s*(?:was|were|is|are)\b[^?]*\?\s*\Z", re.IGNORECASE
 )
+
+# Comparison queries ask the cross-encoder to match one company's filing
+# against wording dominated by a company list, superlative, and final
+# synthesis instruction. Strip that frame deterministically so each company
+# is scored against the fact it needs to contribute. No LLM is used for this
+# transformation, and the original user query is preserved for generation.
+COMPARISON_LEAD_RE = re.compile(
+    r"^\s*(?:among|between)\b.*?\bwhich\s+(?:company|one)\b\s*", re.IGNORECASE | re.DOTALL
+)
+COMPARISON_REPORTING_VERB_RE = re.compile(
+    r"^\s*(?:reported|had|generated|recorded|earned|spent)\s+", re.IGNORECASE
+)
+COMPARISON_SUPERLATIVE_RE = re.compile(
+    r"^\s*(?:the\s+)?(?:highest|higher|lowest|lower|largest|smaller|smallest|most|least)\s+",
+    re.IGNORECASE,
+)
+COMPARISON_RANKING_CLAUSE_RE = re.compile(
+    r"[,;]?\s*(?:then\s+)?rank(?:ing)?\b.*\Z", re.IGNORECASE | re.DOTALL
+)
+REQUESTED_FISCAL_YEAR_RE = re.compile(r"\bfiscal\s+year\s+(?:fy)?(20\d{2}|\d{2})\b", re.I)
+REQUESTED_SEGMENT_RE = re.compile(r"\b([a-z][a-z0-9&-]*)\s+(?:business\s+)?segment\b", re.I)
+GENERIC_SEGMENT_WORDS = {"a", "any", "business", "operating", "reportable", "the", "what", "which"}
 
 logger = logging.getLogger(__name__)
 
@@ -241,12 +262,21 @@ def _safe_semantic_cached(
     doc_type: str | None,
     model: str,
     query_embedding: list[float],
+    top_k: int,
 ):
     # Chroma read on an already-computed embedding; a network hiccup or
     # Chroma lock here shouldn't turn what would otherwise be a normal
     # (uncached) generation into a failed request.
     try:
-        return get_semantic_cached(query, companies, fiscal_year, doc_type, model, query_embedding)
+        return get_semantic_cached(
+            query,
+            companies,
+            fiscal_year,
+            doc_type,
+            model,
+            query_embedding,
+            top_k=top_k,
+        )
     except Exception:
         logger.warning("Semantic cache lookup failed; continuing without it", exc_info=True)
         return None
@@ -313,51 +343,178 @@ def _answer_from_cache(cached, total_start: float) -> AnswerResult:
     )
 
 
-def _rerank_and_gate(
-    query: str, candidates: list[RetrievedChunk], top_k: int
+def _is_explicit_comparison(companies: list[str] | None) -> bool:
+    return len(_normalize_companies(companies)) >= 2
+
+
+def _validate_top_k(top_k: int) -> None:
+    if not 1 <= top_k <= settings.RERANK_CANDIDATE_K:
+        raise ValueError(f"top_k must be between 1 and {settings.RERANK_CANDIDATE_K}")
+
+
+def _company_local_rerank_query(query: str, company: str, requested_companies: list[str]) -> str:
+    """Turn common comparison frames into a company-local fact request.
+
+    Hybrid retrieval still uses the original query, so this helper only
+    changes the cross-encoder's final ranking signal. The transformation is
+    deliberately syntactic: remove the comparison lead/list, superlative,
+    and ranking instruction while retaining the requested metric, period,
+    units, and filing language.
+    """
+    stripped = query.strip()
+    supported_shape = (
+        bool(re.match(r"^(?:among|between)\b", stripped, re.I))
+        and bool(re.search(r"\bwhich company\b", stripped, re.I))
+    ) or (
+        bool(re.match(r"^compare\b", stripped, re.I))
+        and bool(re.search(r"\busing\s+each\s+company['’]s\b", stripped, re.I))
+    )
+    if not supported_shape:
+        # A mixed-metric or free-form comparison cannot be decomposed safely
+        # with string surgery. Preserve the original cross-encoder query.
+        return query
+
+    focus = COMPARISON_LEAD_RE.sub("", stripped, count=1)
+    focus = re.sub(r"^\s*compare\b\s*", "", focus, count=1, flags=re.IGNORECASE)
+    for requested_company in requested_companies:
+        focus = re.sub(rf"\b{re.escape(requested_company)}\b", "", focus, flags=re.IGNORECASE)
+    focus = COMPARISON_REPORTING_VERB_RE.sub("", focus, count=1)
+    focus = COMPARISON_SUPERLATIVE_RE.sub("", focus, count=1)
+    focus = re.sub(r"\beach company['’]s\b", "its", focus, flags=re.IGNORECASE)
+    focus = re.sub(r"\bfor\s*(?:(?:,\s*)|(?:and\s*))*?(?=using\b)", "", focus, flags=re.IGNORECASE)
+    focus = re.sub(r"\busing\s+its\b", "in its", focus, flags=re.IGNORECASE)
+    focus = re.sub(r"\bstate\s+each\s+fiscal year\b", "state the fiscal year", focus, flags=re.I)
+    focus = COMPARISON_RANKING_CLAUSE_RE.sub("", focus)
+    focus = re.sub(r"\s+([,.;:?])", r"\1", focus)
+    focus = re.sub(r"\s+", " ", focus).strip(" ,.;?")
+    if not focus:
+        focus = "information needed for this comparison in its fiscal-year filing"
+    return f"What was {company}'s {focus}?"
+
+
+def _select_explicit_comparison_evidence(
+    query: str,
+    candidates: list[RetrievedChunk],
+    top_k: int,
+    requested_companies: list[str],
 ) -> tuple[list[RetrievedChunk], float]:
-    """Rerank already-retrieved candidates and apply the MIN_RERANK_SCORE
-    gate, handling both the single-company and multi-company comparison
-    branches. Returns (surviving chunks, top reranked score seen across all
-    branches -- 0.0 if there were no candidates to rerank)."""
-    distinct_companies = list(dict.fromkeys(c.company for c in candidates if c.company))
+    """Select a bounded rank-based evidence slice for every requested company.
+
+    Raw BGE sigmoid outputs are intentionally logged but never treated as
+    calibrated answerability probabilities here. Missing a requested group
+    refuses the whole comparison instead of silently generating a partial
+    ranking.
+    """
     top_score = 0.0
-    if len(distinct_companies) > 1:
-        # Comparison query (2+ companies present in the candidates, whether
-        # from an explicit multi-select or incidentally from an unfiltered
-        # search): rerank each company's own candidates independently and
-        # give each its own full top_k budget, rather than reranking the
-        # merged pool once with a single shared top_k. A shared cutoff lets
-        # one company's chunks dominate the budget and starves the rest down
-        # to a chunk or two each -- exactly what made early comparison
-        # answers read as "insufficient context" even when the data existed.
-        # Total context size scales with company count, mirroring how
-        # retrieve_hybrid already gives each company its own full candidate
-        # budget at the retrieval stage rather than splitting one shared
-        # budget across companies.
-        chunks = []
-        for company in distinct_companies:
-            company_candidates = [c for c in candidates if c.company == company]
-            reranked = rerank(query, company_candidates, top_k=top_k)
-            if reranked:
-                top_score = max(top_score, reranked[0].score)
-            chunks.extend(c for c in reranked if c.score >= settings.MIN_RERANK_SCORE)
-        # Candidates with no company tag at all (company=None or "") belong
-        # to no group above and would otherwise silently vanish from a
-        # multi-company comparison, unlike the single-company path below
-        # which includes everything -- give them their own rerank budget too.
-        untagged_candidates = [c for c in candidates if not c.company]
-        if untagged_candidates:
-            reranked = rerank(query, untagged_candidates, top_k=top_k)
-            if reranked:
-                top_score = max(top_score, reranked[0].score)
-            chunks.extend(c for c in reranked if c.score >= settings.MIN_RERANK_SCORE)
-    else:
-        reranked = rerank(query, candidates, top_k=top_k)
-        if reranked:
-            top_score = reranked[0].score
-        chunks = [c for c in reranked if c.score >= settings.MIN_RERANK_SCORE]
+    chunks: list[RetrievedChunk] = []
+    for company in requested_companies:
+        seen_ids: set[int] = set()
+        company_candidates = []
+        for candidate in candidates:
+            if candidate.company == company and candidate.chunk_id not in seen_ids:
+                seen_ids.add(candidate.chunk_id)
+                company_candidates.append(candidate)
+        if not company_candidates:
+            logger.info(
+                "Comparison evidence refusal: company=%r candidate_count=0 reason=missing_scope",
+                company,
+            )
+            return [], top_score
+
+        rerank_query = _company_local_rerank_query(query, company, requested_companies)
+        reranked = rerank(rerank_query, company_candidates, top_k=top_k)
+        company_top_score = reranked[0].score if reranked else 0.0
+        top_score = max(top_score, company_top_score)
+        logger.info(
+            "Comparison evidence: company=%r query_variant=%s "
+            "candidate_count=%d top_score=%.4f selected_count=%d "
+            "absolute_gate_bypassed=%s",
+            company,
+            "company_local" if rerank_query != query else "original_fallback",
+            len(company_candidates),
+            company_top_score,
+            len(reranked),
+            bool(reranked),
+        )
+        if not reranked:
+            logger.info(
+                "Comparison evidence refusal: company=%r reason=empty_rerank_selection",
+                company,
+            )
+            return [], top_score
+        chunks.extend(reranked)
     return chunks, top_score
+
+
+def _rerank_and_gate(
+    query: str,
+    candidates: list[RetrievedChunk],
+    top_k: int,
+    companies: list[str] | None = None,
+) -> tuple[list[RetrievedChunk], float]:
+    """Select evidence using explicit caller scope, not candidate metadata."""
+    requested_companies = _normalize_companies(companies)
+    if len(requested_companies) >= 2:
+        return _select_explicit_comparison_evidence(query, candidates, top_k, requested_companies)
+
+    reranked = rerank(query, candidates, top_k=top_k)
+    top_score = reranked[0].score if reranked else 0.0
+    chunks = [c for c in reranked if c.score >= settings.MIN_RERANK_SCORE]
+    return chunks, top_score
+
+
+def _unsupported_scope_reason(
+    query: str,
+    chunks: list[RetrievedChunk],
+    companies: list[str] | None = None,
+) -> str | None:
+    """Return a deterministic reason when selected evidence misses explicit scope.
+
+    The reranker cannot distinguish a requested period/category from a
+    nearby one. Two narrow lexical checks are safe to make before generation:
+    a stated fiscal year must occur in the selected text or document metadata,
+    and a named singular ``X segment`` must actually be labeled ``X segment``
+    rather than only appearing as an end market/platform/product category.
+    """
+    requested_companies = _normalize_companies(companies)
+    evidence_groups = (
+        [
+            (company, [chunk for chunk in chunks if chunk.company == company])
+            for company in requested_companies
+        ]
+        if len(requested_companies) >= 2
+        else [(None, chunks)]
+    )
+
+    for year_match in REQUESTED_FISCAL_YEAR_RE.finditer(query):
+        year = year_match.group(1)
+        full_year = f"20{year}" if len(year) == 2 else year
+        short_year = full_year[-2:]
+        for company, group in evidence_groups:
+            combined_text = " ".join(chunk.text for chunk in group).lower()
+            metadata_years = {
+                str(chunk.fiscal_year).lower() for chunk in group if chunk.fiscal_year
+            }
+            if (
+                full_year.lower() not in combined_text
+                and f"fy{short_year}".lower() not in combined_text
+                and f"fy{short_year}".lower() not in metadata_years
+                and f"fy{full_year}".lower() not in metadata_years
+            ):
+                suffix = f":{company}" if company else ""
+                return f"requested_fiscal_year_not_in_evidence:{full_year}{suffix}"
+
+    for segment_match in REQUESTED_SEGMENT_RE.finditer(query):
+        label = segment_match.group(1).lower()
+        meaningful_words = [word for word in label.split() if word not in GENERIC_SEGMENT_WORDS]
+        if not meaningful_words:
+            continue
+        for company, group in evidence_groups:
+            combined_text = " ".join(chunk.text for chunk in group).lower()
+            if f"{label} segment" not in combined_text:
+                suffix = f":{company}" if company else ""
+                return f"requested_segment_not_in_evidence:{label}{suffix}"
+    return None
 
 
 def _retrieve_and_rerank(
@@ -384,7 +541,14 @@ def _retrieve_and_rerank(
         doc_type=doc_type,
         query_embedding=query_embedding,
     )
-    chunks, top_score = _rerank_and_gate(query, candidates, top_k)
+    comparison_mode = _is_explicit_comparison(companies)
+    logger.info(
+        "Retrieval selection: comparison_mode=%s requested_companies=%s candidate_count=%d",
+        comparison_mode,
+        _normalize_companies(companies),
+        len(candidates),
+    )
+    chunks, top_score = _rerank_and_gate(query, candidates, top_k, companies)
 
     if not chunks:
         # Nothing cleared the gate -- try once more with a trailing
@@ -402,13 +566,14 @@ def _retrieve_and_rerank(
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
             )
-            chunks, retry_top_score = _rerank_and_gate(cleaned_query, retry_candidates, top_k)
+            chunks, retry_top_score = _rerank_and_gate(
+                cleaned_query, retry_candidates, top_k, companies
+            )
         logger.info(
-            "Rerank gate returned no chunks for query=%r (top_score=%.4f); "
-            "retried with cleaned_query=%r (top_score=%s)",
-            query,
+            "Rerank gate returned no chunks for query_variant=original "
+            "(top_score=%.4f); cleaned_retry_used=%s retry_top_score=%s",
             top_score,
-            cleaned_query,
+            bool(cleaned_query and cleaned_query != query),
             retry_top_score,
         )
 
@@ -424,6 +589,7 @@ def _cached_or_embed(
     doc_type: str | None,
     model: str,
     history: list[HistoryTurn] | None,
+    top_k: int,
     use_cache: bool = True,
 ) -> tuple[object | None, list[float] | None]:
     """Exact-cache lookup, then (only on a miss) a semantic-cache lookup that
@@ -449,7 +615,9 @@ def _cached_or_embed(
     if cached is not None:
         return cached, None
     query_embedding = embed_query(query)
-    cached = _safe_semantic_cached(query, companies, fiscal_year, doc_type, model, query_embedding)
+    cached = _safe_semantic_cached(
+        query, companies, fiscal_year, doc_type, model, query_embedding, top_k
+    )
     return cached, query_embedding
 
 
@@ -478,8 +646,11 @@ def generate_answer(
     run's answer instead of actually re-generating it.
     """
     total_start = time.perf_counter()
+    _validate_top_k(top_k)
     chat_client = client or GeminiChatClient()
-    cache_key = make_cache_key(query, companies, fiscal_year, doc_type, chat_client.model)
+    cache_key = make_cache_key(
+        query, companies, fiscal_year, doc_type, chat_client.model, top_k=top_k
+    )
 
     log_kwargs = dict(
         query_text=query,
@@ -502,6 +673,7 @@ def generate_answer(
             doc_type,
             chat_client.model,
             history,
+            top_k,
             use_cache,
         )
         if cached is not None:
@@ -520,8 +692,21 @@ def generate_answer(
             )
             _safe_record_query_log(result=answer, cache_hit=False, **log_kwargs)
             return answer
+        unsupported_scope_reason = _unsupported_scope_reason(query, chunks, companies)
+        if unsupported_scope_reason is not None:
+            logger.info("Evidence scope refusal: reason=%s", unsupported_scope_reason)
+            answer = _no_relevant_context_answer(
+                chat_client.model, retrieval_latency_ms, total_start
+            )
+            _safe_record_query_log(result=answer, cache_hit=False, **log_kwargs)
+            return answer
 
-        messages = build_messages(query, chunks, history=_history_as_messages(history))
+        messages = build_messages(
+            query,
+            chunks,
+            history=_history_as_messages(history),
+            comparison_mode=_is_explicit_comparison(companies),
+        )
 
         generation_start = time.perf_counter()
         result = chat_client.chat(messages)
@@ -561,6 +746,7 @@ def generate_answer(
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
                 query_embedding=query_embedding,
+                top_k=top_k,
             )
     except Exception as e:
         _safe_record_query_log(
@@ -593,8 +779,11 @@ def generate_answer_stream(
     AnswerResult.answer_text instead of concatenating deltas past the fence).
     """
     total_start = time.perf_counter()
+    _validate_top_k(top_k)
     chat_client = client or GeminiChatClient()
-    cache_key = make_cache_key(query, companies, fiscal_year, doc_type, chat_client.model)
+    cache_key = make_cache_key(
+        query, companies, fiscal_year, doc_type, chat_client.model, top_k=top_k
+    )
 
     log_kwargs = dict(
         query_text=query,
@@ -606,7 +795,14 @@ def generate_answer_stream(
 
     try:
         cached, query_embedding = _cached_or_embed(
-            query, cache_key, companies, fiscal_year, doc_type, chat_client.model, history
+            query,
+            cache_key,
+            companies,
+            fiscal_year,
+            doc_type,
+            chat_client.model,
+            history,
+            top_k,
         )
         if cached is not None:
             answer = _answer_from_cache(cached, total_start)
@@ -628,8 +824,23 @@ def generate_answer_stream(
             _safe_record_query_log(result=answer, cache_hit=False, **log_kwargs)
             yield answer
             return
+        unsupported_scope_reason = _unsupported_scope_reason(query, chunks, companies)
+        if unsupported_scope_reason is not None:
+            logger.info("Evidence scope refusal: reason=%s", unsupported_scope_reason)
+            answer = _no_relevant_context_answer(
+                chat_client.model, retrieval_latency_ms, total_start
+            )
+            yield answer.answer_text
+            _safe_record_query_log(result=answer, cache_hit=False, **log_kwargs)
+            yield answer
+            return
 
-        messages = build_messages(query, chunks, history=_history_as_messages(history))
+        messages = build_messages(
+            query,
+            chunks,
+            history=_history_as_messages(history),
+            comparison_mode=_is_explicit_comparison(companies),
+        )
 
         full_content = []
         generation_start = time.perf_counter()
@@ -679,6 +890,7 @@ def generate_answer_stream(
                 fiscal_year=fiscal_year,
                 doc_type=doc_type,
                 query_embedding=query_embedding,
+                top_k=top_k,
             )
     except Exception as e:
         _safe_record_query_log(

@@ -1,3 +1,5 @@
+import pytest
+
 from config import settings
 from sage.db.conversations import HistoryTurn
 from sage.db.database import get_session
@@ -10,6 +12,12 @@ from sage.generation.answer_engine import (
 )
 from sage.generation.gemini_client import ChatResult, StreamDone, StreamToken
 from sage.retrieval.retriever import RetrievedChunk
+
+
+@pytest.fixture(autouse=True)
+def _fake_answer_engine_embedding(monkeypatch):
+    """Answer-engine tests must never load the real local embedding model."""
+    monkeypatch.setattr(answer_engine, "embed_query", lambda text: [0.0] * 8)
 
 
 def test_fenced_citations_are_parsed_and_stripped():
@@ -587,11 +595,8 @@ def test_generate_answer_gives_each_company_its_own_rerank_budget(monkeypatch):
     assert sorted(result.retrieved_chunk_ids) == [1, 2, 4, 5]
 
 
-def test_generate_answer_keeps_untagged_chunks_in_multi_company_comparison(monkeypatch):
-    """Regression test: a candidate with no company tag (company=None or "")
-    isn't part of any distinct_companies group, so it used to be silently
-    dropped from context whenever 2+ real companies were present -- unlike
-    the single-company path, which includes everything."""
+def test_explicit_comparison_ignores_chunks_outside_requested_company_groups(monkeypatch):
+    """Exact comparison scope must not be diluted by untagged evidence."""
 
     def fake_retrieve_hybrid(
         query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
@@ -615,7 +620,438 @@ def test_generate_answer_keeps_untagged_chunks_in_multi_company_comparison(monke
         "compare capex query", companies=["Apple", "Microsoft"], client=client
     )
 
-    assert sorted(result.retrieved_chunk_ids) == [1, 2, 3]
+    assert result.retrieved_chunk_ids == [1, 2]
+
+
+def test_company_local_rerank_query_removes_comparison_frame_and_other_companies():
+    query = (
+        "Among Apple, Microsoft, and NVIDIA, which company reported the highest "
+        "total revenue in its most recent fiscal year filing?"
+    )
+    companies = ["Apple", "Microsoft", "NVIDIA"]
+
+    local_query = answer_engine._company_local_rerank_query(query, "Microsoft", companies)
+
+    assert local_query == (
+        "What was Microsoft's total revenue in its most recent fiscal year filing?"
+    )
+    assert "Apple" not in local_query
+    assert "NVIDIA" not in local_query
+    assert "highest" not in local_query
+
+
+def test_long_comparison_query_localizes_metric_period_and_units():
+    query = (
+        "Compare total annual revenue for Apple, Microsoft, and NVIDIA using each "
+        "company's ingested fiscal-year filing. State each fiscal year and amount "
+        "in millions, then rank them from highest to lowest."
+    )
+
+    local_query = answer_engine._company_local_rerank_query(
+        query, "Apple", ["Apple", "Microsoft", "NVIDIA"]
+    )
+
+    assert local_query == (
+        "What was Apple's total annual revenue in its ingested fiscal-year filing. "
+        "state the fiscal year and amount in millions?"
+    )
+    assert "rank" not in local_query
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "Compare total revenue for Apple, Microsoft, and NVIDIA.",
+        "Compare Apple and Microsoft revenue.",
+        "Compare Apple's iPhone revenue with Microsoft's Azure revenue.",
+        "Which has more revenue, Apple or Microsoft?",
+        "Between Apple and Microsoft, what was total revenue?",
+    ],
+)
+def test_company_local_rerank_query_preserves_unsupported_comparison_shapes(query):
+    assert (
+        answer_engine._company_local_rerank_query(query, "Apple", ["Apple", "Microsoft"]) == query
+    )
+
+
+def test_explicit_three_company_comparison_keeps_low_score_evidence_and_generates(monkeypatch):
+    companies = ["Apple", "Microsoft", "NVIDIA"]
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        return [
+            _fake_chunk(chunk_id=1, company="Apple", score=0.01),
+            _fake_chunk(chunk_id=2, company="Microsoft", score=0.01),
+            _fake_chunk(chunk_id=3, company="NVIDIA", score=0.01),
+        ]
+
+    rerank_queries = {}
+
+    def fake_rerank(query, candidates, top_k):
+        company = candidates[0].company
+        rerank_queries[company] = query
+        return [_fake_chunk(chunk_id=candidates[0].chunk_id, company=company, score=0.02)]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("All three companies contributed evidence.")
+    result = answer_engine.generate_answer(
+        "Compare total annual revenue for Apple, Microsoft, and NVIDIA using each "
+        "company's ingested fiscal-year filing.",
+        companies=companies,
+        client=client,
+    )
+
+    assert client.calls["chat"] == 1
+    assert result.retrieved_chunk_ids == [1, 2, 3]
+    assert set(rerank_queries) == set(companies)
+    for company, local_query in rerank_queries.items():
+        assert company in local_query
+        assert all(other not in local_query for other in companies if other != company)
+    assert "Compare total annual revenue" in client.last_messages[-1]["content"]
+
+
+def test_explicit_two_company_comparison_keeps_score_just_below_global_gate(monkeypatch):
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        return [
+            _fake_chunk(chunk_id=1, company="Apple"),
+            _fake_chunk(chunk_id=2, company="Microsoft"),
+        ]
+
+    def fake_rerank(query, candidates, top_k):
+        candidate = candidates[0]
+        return [
+            _fake_chunk(
+                chunk_id=candidate.chunk_id,
+                company=candidate.company,
+                score=0.093,
+            )
+        ]
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("Comparison answer.")
+    result = answer_engine.generate_answer(
+        "Compare revenue.", companies=["Apple", "Microsoft"], client=client
+    )
+
+    assert client.calls["chat"] == 1
+    assert result.retrieved_chunk_ids == [1, 2]
+
+
+def test_single_company_score_just_below_global_gate_still_refuses(monkeypatch):
+    monkeypatch.setattr(
+        answer_engine,
+        "retrieve_hybrid",
+        lambda *a, **kw: [_fake_chunk(chunk_id=1, company="Microsoft")],
+    )
+    monkeypatch.setattr(
+        answer_engine,
+        "rerank",
+        lambda *a, **kw: [_fake_chunk(chunk_id=1, company="Microsoft", score=0.093)],
+    )
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        "What was Microsoft's revenue?", companies=["Microsoft"], client=client
+    )
+
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
+def test_unfiltered_mixed_company_candidates_use_one_global_threshold_gate(monkeypatch):
+    candidates = [
+        _fake_chunk(chunk_id=1, company="Apple"),
+        _fake_chunk(chunk_id=2, company="Microsoft"),
+    ]
+    rerank_calls = []
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", lambda *a, **kw: candidates)
+
+    def fake_rerank(query, received, top_k):
+        rerank_calls.append(received)
+        return [_fake_chunk(chunk_id=c.chunk_id, company=c.company, score=0.01) for c in received]
+
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer("unfiltered comparison-like query", client=client)
+
+    assert len(rerank_calls) == 1
+    assert rerank_calls[0] == candidates
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
+def test_explicit_comparison_missing_requested_company_refuses_without_generation(monkeypatch):
+    monkeypatch.setattr(
+        answer_engine,
+        "retrieve_hybrid",
+        lambda *a, **kw: [
+            _fake_chunk(chunk_id=1, company="Apple"),
+            _fake_chunk(chunk_id=2, company="Microsoft"),
+        ],
+    )
+    monkeypatch.setattr(answer_engine, "rerank", lambda query, candidates, top_k: candidates)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        "Compare revenue.",
+        companies=["Apple", "Microsoft", "NVIDIA"],
+        client=client,
+    )
+
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+    assert result.retrieved_chunk_ids == []
+
+
+def test_explicit_out_of_corpus_company_refuses_before_generation(monkeypatch):
+    captured = {}
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        captured["companies"] = companies
+        return []
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        "Compare Apple and Tesla revenue.",
+        companies=["Apple", "Tesla"],
+        client=client,
+    )
+
+    assert captured["companies"] == ["Apple", "Tesla"]
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
+def test_explicit_wrong_fiscal_year_scope_refuses_before_generation(monkeypatch):
+    captured = {}
+
+    def fake_retrieve_hybrid(
+        query, top_k, companies=None, fiscal_year=None, doc_type=None, query_embedding=None
+    ):
+        captured["fiscal_year"] = fiscal_year
+        return []
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", fake_retrieve_hybrid)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        "Compare revenue in FY20.",
+        companies=["Apple", "Microsoft"],
+        fiscal_year="FY20",
+        client=client,
+    )
+
+    assert captured["fiscal_year"] == "FY20"
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
+def test_single_company_nonexistent_fact_does_not_use_comparison_fallback(monkeypatch):
+    query = "How much revenue did NVIDIA's Automotive segment generate in fiscal year 2026?"
+    rerank_queries = []
+
+    monkeypatch.setattr(
+        answer_engine,
+        "retrieve_hybrid",
+        lambda *a, **kw: [_fake_chunk(chunk_id=1, company="NVIDIA")],
+    )
+
+    def fake_rerank(rerank_query, candidates, top_k):
+        rerank_queries.append(rerank_query)
+        return [_fake_chunk(chunk_id=1, company="NVIDIA", score=0.998)]
+
+    monkeypatch.setattr(answer_engine, "rerank", fake_rerank)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(query, companies=["NVIDIA"], client=client)
+
+    assert rerank_queries == [query]
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+    assert result.citations == []
+
+
+def test_explicit_comparison_nonexistent_segment_refuses_before_generation(monkeypatch):
+    query = "Compare Automotive segment revenue for Microsoft and NVIDIA in fiscal year 2026."
+    candidates = [
+        _fake_chunk(chunk_id=1, company="Microsoft"),
+        _fake_chunk(chunk_id=2, company="NVIDIA"),
+    ]
+    for chunk in candidates:
+        chunk.text = "The filing discusses products and consolidated revenue in fiscal year 2026."
+        chunk.fiscal_year = "FY26"
+
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", lambda *a, **kw: candidates)
+    monkeypatch.setattr(
+        answer_engine,
+        "rerank",
+        lambda query, chunks, top_k: chunks,
+    )
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(query, companies=["Microsoft", "NVIDIA"], client=client)
+
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+    assert result.citations == []
+
+
+def test_top_k_must_be_within_candidate_budget():
+    client = _FakeClient("should never be called")
+
+    with pytest.raises(ValueError, match="top_k must be between"):
+        answer_engine.generate_answer("query", top_k=-1, client=client)
+    with pytest.raises(ValueError, match="top_k must be between"):
+        list(
+            answer_engine.generate_answer_stream(
+                "query", top_k=settings.RERANK_CANDIDATE_K + 1, client=client
+            )
+        )
+
+    assert client.calls["chat"] == 0
+
+
+def test_scope_validation_accepts_an_explicitly_named_segment():
+    chunks = [
+        _fake_chunk(company="NVIDIA"),
+    ]
+    chunks[0].text = (
+        "The Compute & Networking segment reported revenue, while the Graphics segment "
+        "reported a smaller amount."
+    )
+
+    reason = answer_engine._unsupported_scope_reason(
+        "What revenue did the Graphics segment report?", chunks
+    )
+
+    assert reason is None
+
+
+def test_scope_validation_rejects_period_missing_from_text_and_metadata():
+    chunks = [_fake_chunk(company="Apple")]
+    chunks[0].text = "Apple reported fiscal year 2025 net sales."
+    chunks[0].fiscal_year = "FY25"
+
+    reason = answer_engine._unsupported_scope_reason(
+        "What were Apple's net sales in fiscal year 2020?", chunks
+    )
+
+    assert reason == "requested_fiscal_year_not_in_evidence:2020"
+
+
+def test_explicit_comparison_citations_align_with_company_chunks(monkeypatch):
+    candidates = [
+        _fake_chunk(chunk_id=11, company="Apple"),
+        _fake_chunk(chunk_id=22, company="Microsoft"),
+        _fake_chunk(chunk_id=33, company="NVIDIA"),
+    ]
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", lambda *a, **kw: candidates)
+    monkeypatch.setattr(answer_engine, "rerank", lambda query, chunks, top_k: chunks)
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *a, **kw: None)
+
+    content = (
+        "Apple [1], Microsoft [2], and NVIDIA [3] all contributed evidence.\n"
+        "```citations\n[1, 2, 3]\n```"
+    )
+    result = answer_engine.generate_answer(
+        "Compare the three companies.",
+        companies=["Apple", "Microsoft", "NVIDIA"],
+        client=_FakeClient(content),
+    )
+
+    assert [(c.n, c.chunk_id, c.company, c.filename) for c in result.citations] == [
+        (1, 11, "Apple", "Apple_FY24_10-K.pdf"),
+        (2, 22, "Microsoft", "Microsoft_FY24_10-K.pdf"),
+        (3, 33, "NVIDIA", "NVIDIA_FY24_10-K.pdf"),
+    ]
+
+
+def test_streaming_and_non_streaming_share_identical_retrieval_selection_scope(monkeypatch):
+    calls = []
+
+    def fake_cached_or_embed(*args, **kwargs):
+        return None, [0.0] * 8
+
+    def fake_retrieve_and_rerank(
+        query, top_k, companies, fiscal_year, doc_type, query_embedding=None
+    ):
+        calls.append((query, top_k, companies, fiscal_year, doc_type, query_embedding))
+        return [
+            _fake_chunk(chunk_id=1, company="Apple"),
+            _fake_chunk(chunk_id=2, company="Microsoft"),
+        ], 1.0
+
+    monkeypatch.setattr(answer_engine, "_cached_or_embed", fake_cached_or_embed)
+    monkeypatch.setattr(answer_engine, "_retrieve_and_rerank", fake_retrieve_and_rerank)
+
+    kwargs = {
+        "query": "Compare revenue.",
+        "top_k": 3,
+        "companies": ["Apple", "Microsoft"],
+        "fiscal_year": "FY25",
+        "doc_type": "filing",
+    }
+    answer_engine.generate_answer(**kwargs, client=_FakeClient("answer"))
+    list(answer_engine.generate_answer_stream(**kwargs, client=_FakeClient("answer")))
+
+    assert calls == [
+        ("Compare revenue.", 3, ["Apple", "Microsoft"], "FY25", "filing", [0.0] * 8),
+        ("Compare revenue.", 3, ["Apple", "Microsoft"], "FY25", "filing", [0.0] * 8),
+    ]
+
+
+def test_streaming_and_non_streaming_both_refuse_unsupported_scope(monkeypatch):
+    chunk = _fake_chunk(company="Apple")
+    chunk.text = "Apple reported fiscal year 2025 net sales."
+    chunk.fiscal_year = "FY25"
+    monkeypatch.setattr(
+        answer_engine,
+        "_cached_or_embed",
+        lambda *args, **kwargs: (None, [0.0] * 8),
+    )
+    monkeypatch.setattr(
+        answer_engine,
+        "_retrieve_and_rerank",
+        lambda *args, **kwargs: ([chunk], 1.0),
+    )
+
+    client = _FakeClient("should never be called")
+    kwargs = {
+        "query": "What were Apple's net sales in fiscal year 2020?",
+        "companies": ["Apple"],
+        "client": client,
+    }
+    direct = answer_engine.generate_answer(**kwargs)
+    streamed = list(answer_engine.generate_answer_stream(**kwargs))
+    streamed_result = streamed[-1]
+
+    assert direct.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+    assert isinstance(streamed_result, answer_engine.AnswerResult)
+    assert streamed_result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+    assert client.calls["chat"] == 0
+    assert client.calls["chat_stream"] == 0
 
 
 def test_generate_answer_with_history_bypasses_cache(monkeypatch):

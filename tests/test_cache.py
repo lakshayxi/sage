@@ -57,6 +57,17 @@ def test_make_cache_key_is_sensitive_to_filters_and_model():
     assert base != no_companies
 
 
+def test_make_cache_key_is_sensitive_to_top_k():
+    key_five = cache.make_cache_key(
+        "compare capex", ["Apple", "Microsoft"], None, None, "gemini-2.5-flash", top_k=5
+    )
+    key_three = cache.make_cache_key(
+        "compare capex", ["Apple", "Microsoft"], None, None, "gemini-2.5-flash", top_k=3
+    )
+
+    assert key_five != key_three
+
+
 def test_get_cached_returns_none_for_unknown_key():
     assert cache.get_cached("no-such-key") is None
 

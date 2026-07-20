@@ -34,6 +34,9 @@ def test_rerank_orders_by_cross_encoder_score(monkeypatch):
     assert len(result) == 1
     assert result[0].chunk_id == 2
     assert result[0].score == 0.9
+    assert chunks[0].score == 0.0
+    assert chunks[1].score == 0.0
+    assert result[0] is not chunks[1]
 
 
 def test_rerank_truncates_to_top_k(monkeypatch):
@@ -58,6 +61,23 @@ def test_rerank_returns_empty_for_no_candidates(monkeypatch):
     monkeypatch.setattr(reranker, "_get_model", _fail)
 
     assert reranker.rerank("query", [], top_k=5) == []
+
+
+def test_rerank_query_variants_do_not_overwrite_prior_results(monkeypatch):
+    chunks = [_make_chunk(1, "first", score=0.25), _make_chunk(2, "second", score=0.5)]
+
+    class FakeCrossEncoder:
+        def predict(self, pairs):
+            return [0.9, 0.1] if pairs[0][0] == "query A" else [0.2, 0.8]
+
+    monkeypatch.setattr(reranker, "_get_model", lambda: FakeCrossEncoder())
+
+    result_a = reranker.rerank("query A", chunks, top_k=2)
+    result_b = reranker.rerank("query B", chunks, top_k=2)
+
+    assert [(c.chunk_id, c.score) for c in result_a] == [(1, 0.9), (2, 0.1)]
+    assert [(c.chunk_id, c.score) for c in result_b] == [(2, 0.8), (1, 0.2)]
+    assert [c.score for c in chunks] == [0.25, 0.5]
 
 
 def test_min_rerank_score_gating_drops_low_scoring_chunks(monkeypatch):
