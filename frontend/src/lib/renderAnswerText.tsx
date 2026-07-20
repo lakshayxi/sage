@@ -1,92 +1,121 @@
-import type { ReactNode } from 'react'
+import { Children, type ReactNode } from 'react'
+import ReactMarkdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { CitationMarker } from '../components/CitationMarker'
 
-// The model's actual output shape (see sage/generation/prompts.py) is
-// plain paragraphs, occasional **bold** company headings in comparison
-// answers, occasional bullet/numbered lists, and inline [n] citations --
-// this covers exactly that, not general-purpose markdown.
+interface AnswerMarkdownProps {
+  text: string
+  interactive: boolean
+}
 
-const CITATION_RE = /\[(\d+)\]/g
-const BOLD_RE = /\*\*(.+?)\*\*/g
+const CITATION_GROUP_RE = /\[(\s*\d+(?:\s*,\s*\d+)*)\]/g
 
-function renderBold(text: string, keyPrefix: string): ReactNode[] {
+function renderCitationText(text: string, interactive: boolean): ReactNode {
   const nodes: ReactNode[] = []
   let lastIndex = 0
   let match: RegExpExecArray | null
-  let i = 0
-  BOLD_RE.lastIndex = 0
-  while ((match = BOLD_RE.exec(text))) {
+  let groupIndex = 0
+  CITATION_GROUP_RE.lastIndex = 0
+
+  while ((match = CITATION_GROUP_RE.exec(text))) {
     if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index))
+
+    const citationNumbers = match[1].split(',').map((value) => Number(value.trim()))
     nodes.push(
-      <strong key={`${keyPrefix}-b${i}`} className="font-semibold text-text">
-        {match[1]}
-      </strong>,
+      <span
+        key={`citation-group-${match.index}-${groupIndex}`}
+        className="inline-flex items-baseline gap-1 whitespace-nowrap"
+      >
+        {citationNumbers.map((n, citationIndex) => (
+          <span key={`${n}-${citationIndex}`} className="inline-flex items-baseline gap-1">
+            {citationIndex > 0 && <span className="text-text-muted">,</span>}
+            <CitationMarker n={n} interactive={interactive} />
+          </span>
+        ))}
+      </span>,
     )
-    lastIndex = BOLD_RE.lastIndex
-    i += 1
+
+    lastIndex = CITATION_GROUP_RE.lastIndex
+    groupIndex += 1
   }
+
+  if (lastIndex === 0) return text
   if (lastIndex < text.length) nodes.push(text.slice(lastIndex))
   return nodes
 }
 
-function renderInline(text: string, interactive: boolean, keyPrefix: string): ReactNode[] {
-  const nodes: ReactNode[] = []
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-  let i = 0
-  CITATION_RE.lastIndex = 0
-  while ((match = CITATION_RE.exec(text))) {
-    if (match.index > lastIndex) {
-      nodes.push(...renderBold(text.slice(lastIndex, match.index), `${keyPrefix}-t${i}`))
-    }
-    nodes.push(
-      <CitationMarker key={`${keyPrefix}-c${i}`} n={Number(match[1])} interactive={interactive} />,
-    )
-    lastIndex = CITATION_RE.lastIndex
-    i += 1
-  }
-  if (lastIndex < text.length) {
-    nodes.push(...renderBold(text.slice(lastIndex), `${keyPrefix}-t${i}`))
-  }
-  return nodes
+function renderCitations(children: ReactNode, interactive: boolean): ReactNode {
+  return Children.map(children, (child) =>
+    typeof child === 'string' ? renderCitationText(child, interactive) : child,
+  )
 }
 
-/** Renders LLM answer text as paragraphs/lists/bold with inline citation markers. */
-export function renderAnswerText(text: string, interactive: boolean): ReactNode[] {
-  const blocks = text.trim().split(/\n{2,}/)
-  return blocks.map((block, blockIndex) => {
-    const lines = block.split('\n').filter((line) => line.trim().length > 0)
-    const isBulletList = lines.length > 0 && lines.every((line) => /^[-*]\s+/.test(line.trim()))
-    const isNumberedList = lines.length > 0 && lines.every((line) => /^\d+\.\s+/.test(line.trim()))
+function markdownComponents(interactive: boolean): Components {
+  const inline = (children: ReactNode) => renderCitations(children, interactive)
 
-    if (isBulletList) {
-      return (
-        <ul key={blockIndex} className="list-disc space-y-1 pl-5">
-          {lines.map((line, i) => (
-            <li key={i}>
-              {renderInline(line.trim().replace(/^[-*]\s+/, ''), interactive, `${blockIndex}-${i}`)}
-            </li>
-          ))}
-        </ul>
-      )
-    }
+  return {
+    h1: ({ children }) => (
+      <h1 className="font-display text-2xl font-semibold tracking-tight">{inline(children)}</h1>
+    ),
+    h2: ({ children }) => (
+      <h2 className="font-display text-xl font-semibold tracking-tight">{inline(children)}</h2>
+    ),
+    h3: ({ children }) => (
+      <h3 className="font-display text-lg font-semibold tracking-tight">{inline(children)}</h3>
+    ),
+    h4: ({ children }) => <h4 className="font-semibold text-text">{inline(children)}</h4>,
+    h5: ({ children }) => <h5 className="font-semibold text-text">{inline(children)}</h5>,
+    h6: ({ children }) => <h6 className="font-semibold text-text">{inline(children)}</h6>,
+    p: ({ children }) => <p className="leading-relaxed">{inline(children)}</p>,
+    strong: ({ children }) => (
+      <strong className="font-semibold text-text">{inline(children)}</strong>
+    ),
+    em: ({ children }) => <em>{inline(children)}</em>,
+    del: ({ children }) => <del>{inline(children)}</del>,
+    a: ({ children, href }) => (
+      <a
+        href={href}
+        className="text-accent underline decoration-accent/50 underline-offset-2 hover:text-accent-hover"
+      >
+        {inline(children)}
+      </a>
+    ),
+    ul: ({ children }) => <ul className="list-disc space-y-1 pl-5">{children}</ul>,
+    ol: ({ children }) => <ol className="list-decimal space-y-1 pl-5">{children}</ol>,
+    li: ({ children }) => <li className="leading-relaxed">{inline(children)}</li>,
+    blockquote: ({ children }) => (
+      <blockquote className="border-l-2 border-accent/50 pl-3 text-text-muted">
+        {children}
+      </blockquote>
+    ),
+    table: ({ children }) => (
+      <div className="overflow-x-auto rounded-lg border border-border">
+        <table className="w-full border-collapse text-sm">{children}</table>
+      </div>
+    ),
+    thead: ({ children }) => <thead className="bg-panel">{children}</thead>,
+    th: ({ children }) => (
+      <th className="border-b border-border px-3 py-2 text-left font-semibold text-text">
+        {inline(children)}
+      </th>
+    ),
+    td: ({ children }) => (
+      <td className="border-t border-border px-3 py-2 align-top leading-relaxed">
+        {inline(children)}
+      </td>
+    ),
+  }
+}
 
-    if (isNumberedList) {
-      return (
-        <ol key={blockIndex} className="list-decimal space-y-1 pl-5">
-          {lines.map((line, i) => (
-            <li key={i}>
-              {renderInline(line.trim().replace(/^\d+\.\s+/, ''), interactive, `${blockIndex}-${i}`)}
-            </li>
-          ))}
-        </ol>
-      )
-    }
-
-    return (
-      <p key={blockIndex} className="leading-relaxed">
-        {renderInline(block, interactive, `${blockIndex}`)}
-      </p>
-    )
-  })
+/** Safely renders streamed assistant Markdown with interactive inline citations. */
+export function AnswerMarkdown({ text, interactive }: AnswerMarkdownProps) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={markdownComponents(interactive)}
+      skipHtml
+    >
+      {text}
+    </ReactMarkdown>
+  )
 }

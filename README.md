@@ -1,327 +1,215 @@
 # Sage
 
-**An AI-native financial research workspace — not "chat with your PDFs."** Ask a question about a real 10-K filing and get a grounded, page-cited answer in seconds, with retrieval quality and citation trust treated as the product, not an afterthought.
+A financial research copilot for querying and comparing SEC filings.
 
-Sage ingests SEC filings, retrieves the right passages with hybrid search + cross-encoder reranking, and generates cited answers via Gemini — streamed live into a three-panel workspace UI built for cross-company comparison, not single-document chat.
+[![CI](https://github.com/lakshayxi/sage/actions/workflows/ci.yml/badge.svg)](https://github.com/lakshayxi/sage/actions/workflows/ci.yml)
+[![Python 3.11](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](pyproject.toml)
 
----
+Ask a question about one filing or compare explicitly selected companies. Sage retrieves relevant passages, streams a focused answer, and returns each citation with its source filename, page, and retrieved text.
 
-## Why Sage exists
+Sage has been exercised and evaluated on real SEC 10-K filings for **Apple FY2025**, **Microsoft FY2025**, and **NVIDIA FY2026**.
 
-Most "chat with your PDF" tools optimize for a demo, not for trust. Sage is built around two harder constraints instead:
+![Sage financial research workspace showing a grounded cross-company comparison](docs/assets/sage-workspace.png)
 
-- **Every claim must be citeable to an exact source chunk** — page number, company, fiscal year — or the system says so and refuses to answer, rather than generating a plausible-sounding guess.
-- **Comparing companies is a first-class query shape**, not an afterthought bolted onto single-document Q&A — "compare Apple, Microsoft, and NVIDIA's R&D spend" gets a structured, per-company answer with its own retrieval budget for each company, not one blended paragraph.
+## What Sage does
 
-## Features
+- **Answers from filing evidence.** Inline citations resolve to the exact passages supplied to the model. The API preserves the source filename, page, chunk ID, company, fiscal year, and passage text.
+- **Compares companies without starving either side.** When two or more companies are explicitly selected, Sage runs company-scoped hybrid retrieval with a full candidate budget per company, merges the candidates round-robin, then reranks and selects evidence independently within each company.
+- **Refuses unsupported scopes early.** Narrow checks can reject requests for an unavailable company, fiscal year, or named reportable segment before a Gemini call is made.
+- **Supports real research sessions.** The React interface streams answers, keeps resumable conversations, exposes company filters, and makes cited passages inspectable beside the answer.
 
-- **Grounded, cited answers** — every factual claim resolves to a specific ingested chunk (company / fiscal year / doc type / page). Ordinary queries retain a hard cross-encoder gate; explicit comparisons use bounded per-company rank selection plus requested-scope completeness checks. Citation numbers resolve deterministically by position against the chunks actually shown to the model — a citation's identity is never taken from the model's own (possibly wrong) `chunk_id` echo.
-- **Compare Mode** — explicitly select multiple companies and each gets its own independent retrieval and reranking budget instead of sharing one pool. Reranking uses a deterministic company-local fact query while Gemini still receives the original comparison wording, and the prompt switches to a structured per-company-then-comparison format.
-- **Hybrid retrieval** — BM25 keyword search + vector similarity, fused via reciprocal rank fusion, narrowed by a `BAAI/bge-reranker-base` cross-encoder. A query is embedded exactly once per request and reused across the semantic cache check and every company's retrieval call in a comparison query, not re-embedded per company.
-- **Fully local embeddings** — `sentence-transformers` (`BAAI/bge-small-en-v1.5`) runs in-process, so retrieval has zero API cost and zero quota risk; only generation calls out to Gemini.
-- **Live streaming answers** via `fetch()` + a streamed `ReadableStream` (not `EventSource`), so the query, filters, and session token travel in a POST body/headers instead of a URL query string — with a fence-buffered stream so the model's internal citation-JSON block never leaks into what the user sees typing.
-- **Resumable, session-isolated conversations** — multi-turn history per conversation, scoped to an unguessable per-visitor session token so one visitor can never read another's questions or answers.
-- **Two-layer query cache** — exact-match (SQLite) checked first, semantic (embedding-similarity, Chroma-backed) on a miss, both TTL-expiring; an expired row is refreshed in place by the next generated answer rather than blocking future writes forever.
-- **Page-exact chunking** — a chunk never spans a page boundary and an oversized paragraph is split into bounded, overlapping windows, so a citation's page number is always exactly right, never just "the page the chunk started on."
-- **Recoverable, idempotent ingestion** — a checksum-based dedup skips re-ingesting identical file content, and a failure partway through cleans up any Chroma vectors already written so nothing is orphaned across the two separate (non-transactional) stores.
-- **Retrieval-quality eval harness** (`sage-eval`) — a 19-item hand-curated Q&A set (including full multi-company figures/ranking, multi-turn follow-ups, and distractor-adjacent unanswerable items) run against the real ingested corpus with caching disabled, scored on numeric correctness, per-company citation grounding/text support, gold-evidence recall, and citation-number mapping validity — not just "did retrieval return something."
-- **Public-deployment guardrails** — a rate-limited, non-secret demo-access deterrent (not a real auth boundary — see Design decisions), and uploads disabled by default (`ALLOW_UPLOADS=false`) with streamed/bounded/content-validated writes when enabled, so a public demo can't be turned into an open PDF-processing service.
+### A verified comparison
 
-## Architecture
+One evaluation prompt asks:
 
-```mermaid
-graph TD
-    UI["React + Vite workspace<br/>frontend/src"] -->|fetch + ReadableStream| API
+> Compare total annual revenue for Apple, Microsoft, and NVIDIA using each company's ingested fiscal-year filing. State each fiscal year and amount in millions, then rank them from highest to lowest.
 
-    subgraph API["FastAPI (api/)"]
-        Chat["/chat, /chat/stream"]
-        Conv["/conversations"]
-        Docs["/documents"]
-        MW["DemoKeyMiddleware<br/>+ slowapi rate limiter"]
-    end
+Sage returned the three filing-specific figures and the correct ranking:
 
-    Chat --> Engine
-    Conv --> DB
-    Docs --> Ingest
+| Rank | Filing | Reported revenue |
+|---:|---|---:|
+| 1 | Apple FY2025 | $416,161M |
+| 2 | Microsoft FY2025 | $281,724M |
+| 3 | NVIDIA FY2026 | $215,938M |
 
-    subgraph Core["sage/"]
-        Engine["generation/answer_engine.py<br/>cache → retrieve → rerank → generate"]
-        Retrieval["retrieval/<br/>hybrid BM25+vector, reranker"]
-        Ingest["ingest/<br/>PDF → chunks"]
-        Embed["embed/local_embedder.py<br/>sentence-transformers, local"]
-    end
+The comparison path gives each selected company its own retrieval budget. A company-local query can be used for reranking, while the original question is preserved for generation.
 
-    Engine --> Retrieval
-    Engine --> Gemini["Gemini API<br/>(generation only)"]
-    Retrieval --> Embed
-    Retrieval --> Chroma[("Chroma<br/>vectors + filter metadata")]
-    Retrieval --> DB[("SQLite<br/>chunk text · conversations · cache")]
-    Ingest --> Embed
-    Ingest --> Chroma
-    Ingest --> DB
-```
-
-Embeddings are the one deliberate asymmetry in this diagram: generation depends on an external API (Gemini), but retrieval — the part that runs on *every single query*, not just at ingest time — never does. That split is a direct consequence of a real Gemini free-tier embedding quota wall hit during development (see [Design decisions](#design-decisions)).
-
-## Query lifecycle
+## How it works
 
 ```mermaid
-sequenceDiagram
-    participant U as Browser
-    participant API as FastAPI (/chat/stream)
-    participant Cache as Query cache
-    participant Ret as Hybrid retriever
-    participant RR as Cross-encoder
-    participant LLM as Gemini
+flowchart LR
+    PDFs[SEC filing PDFs] --> Parse[PyMuPDF extraction<br/>page-local chunking]
+    Parse --> Embed[Local BGE embeddings]
+    Parse --> SQLite[(SQLite<br/>text, metadata, sessions, cache)]
+    Embed --> Chroma[(Chroma<br/>vectors and filters)]
 
-    U->>API: question + companies[] + session token
-    API->>Cache: exact/semantic lookup (skipped if conversation has history)
-    alt cache hit
-        Cache-->>API: cached answer
-        API-->>U: answer + citations, no LLM call
-    else cache miss
-        API->>Ret: hybrid retrieve (BM25 + vector, per company if 2+)
-        Ret-->>API: candidate chunks
-        API->>RR: rerank (ordinary gate or explicit per-company rank budget)
-        RR-->>API: bounded, scope-validated chunks
-        alt no ordinary evidence or requested comparison group/scope missing
-            API-->>U: deterministic refusal, zero LLM calls
-        else
-            API->>LLM: generate (comparison prompt if 2+ companies)
-            LLM-->>API: streamed tokens + citation block
-            API-->>U: SSE deltas, then resolved citations
-        end
-    end
+    UI[React UI] --> API[FastAPI]
+    API --> Engine[Answer engine]
+    CLI[Sage CLI] --> Engine
+    Engine --> Cache{Exact or semantic<br/>cache hit?}
+    Cache -->|Yes| Answer[Response to caller<br/>answer with citations]
+    Cache -->|No| Retrieve[Per-company hybrid retrieval<br/>BM25 + vector search]
+    SQLite --> Retrieve
+    Chroma --> Retrieve
+    Retrieve --> Balance[Round-robin merge<br/>of per-company candidates]
+    Balance --> Rerank[Per-company BGE reranking<br/>and evidence selection]
+    Rerank --> Scope{Supported scope?}
+    Scope -->|No| Refusal[Pre-generation refusal]
+    Scope -->|Yes| Gemini[Gemini generation]
+    Gemini --> Resolve[Deterministic citation resolution]
+    Resolve --> Answer
+    Refusal --> Answer
 ```
 
-## Tech stack
+The query path combines BM25 keyword search with Chroma vector search through reciprocal rank fusion, then narrows the candidate set with a local cross-encoder. Gemini receives the original question and the selected filing passages. Citation numbers are resolved positionally against those passages rather than trusting model-supplied chunk identifiers.
 
-| Layer | Technology |
+## Evaluation
+
+The current evaluation is a hand-curated set of 19 checks run uncached through the real retrieval path and, for answerable questions, live Gemini generation.
+
+| Check | Result |
+|---|---:|
+| Overall | **19/19** |
+| Answerable questions | **15/15** |
+| Refusals | **4/4** |
+| Answerable gold-evidence recall | **15/15** |
+| Citation number-to-chunk mapping | **19/19** |
+| Citation textual support | **19/19** |
+| Company/citation association | **19/19** |
+
+These results cover the three ingested 10-Ks listed above. They measure this corpus and pipeline, not financial question answering in general. The deterministic scorer checks expected figures and keywords, source-file grounding, cited passage support, citation mapping, and company-to-value citation association. The citation totals include four clean no-citation refusals. Company-to-citation association is evaluated directly on comparison questions.
+
+The [evaluation dataset](eval/dataset.py), [scorer](eval/scoring.py), and [runner](eval/run_eval.py) are committed with the project. The latest recorded real-corpus validation is summarized in the [user-testing notes](docs/user-testing/user-testing.md).
+
+Run the full live evaluation with:
+
+```bash
+.venv/bin/sage-eval
+```
+
+This requires the same three filings, a valid `GEMINI_API_KEY`, and live Gemini access. Every evaluation run disables the answer cache.
+
+## Engineering quality
+
+**290 backend tests pass under Python 3.11.** They cover ingestion deduplication and rollback, page-safe chunking, hybrid and balanced retrieval, reranking, scope refusals, citation integrity, exact and semantic caching, shared streaming/non-streaming retrieval and citation behavior, API validation, upload limits, rate limiting, and conversation isolation. Gemini is replaced with network-free fakes in the test suite; the local embedding and reranking models download from Hugging Face on first use.
+
+The frontend test suite covers stream parsing, Markdown rendering, grouped citations, and right-panel behavior, alongside Oxlint, TypeScript checks, and a production Vite build. CI installs the Python 3.11 dependency lock, runs the backend tests and Ruff checks, then runs the frontend lint, tests, typecheck, and build.
+
+The deployment path is a single CPU-only Docker image that builds the frontend and serves it with FastAPI. The committed image currently requires a corpus to be ingested and packaged before deployment.
+
+## Product surface
+
+| Layer | Implementation |
 |---|---|
-| Frontend | React 19 + TypeScript, Vite 8, Tailwind CSS 4 |
-| API | FastAPI, SSE streaming, `slowapi` rate limiting |
-| Generation | Gemini API (`gemini-flash-lite-latest` by default) — the only paid/networked call in the query path |
-| Embeddings | `sentence-transformers` (`BAAI/bge-small-en-v1.5`, 384-d), fully local |
-| Reranking | `sentence-transformers` `CrossEncoder` (`BAAI/bge-reranker-base`) |
-| Keyword retrieval | `rank-bm25` |
-| Vector store | Chroma |
-| Relational store | SQLite via SQLAlchemy |
-| PDF parsing | PyMuPDF |
-| Deployment | Docker (single image, frontend + API), Hugging Face Spaces |
+| Interface | React 19, TypeScript, Vite, Tailwind CSS |
+| API | FastAPI with validated JSON and streamed responses |
+| Retrieval | BM25 + BGE vector search, reciprocal rank fusion |
+| Reranking | Local `BAAI/bge-reranker-base` cross-encoder |
+| Generation | Gemini via `google-genai` |
+| Storage | SQLite for source text and application state; Chroma for vectors |
+| Caching | TTL-based exact and semantic answer caches |
+| Ingestion | PyMuPDF, page-local overlapping chunks, SHA-256 deduplication |
+| Deployment | Multi-stage, CPU-only Docker image; corpus supplied by the deployer |
 
-## Folder structure
-
-```
-sage/
-├── api/                  # FastAPI app: routes, schemas, middleware, rate limiting
-│   └── routes/           # chat.py, conversations.py, documents.py
-├── sage/                 # Core backend package
-│   ├── ingest/            # PDF loading, paragraph-aware chunking, metadata parsing
-│   ├── embed/              # Local sentence-transformers embedder
-│   ├── retrieval/          # Hybrid (BM25+vector) retrieval, cross-encoder reranker
-│   ├── generation/         # Prompts, citation parsing, answer_engine.py orchestration, cache
-│   ├── db/                 # SQLAlchemy models + conversation/query-log helpers
-│   ├── cli.py              # sage ingest / ask / conversations
-│   └── retry.py            # Backoff wrapper for Gemini 429/5xx
-├── frontend/              # React + Vite workspace UI (three-panel layout)
-│   └── src/
-│       ├── api/             # Typed fetch client (incl. streamed ReadableStream parsing), session-token handling
-│       ├── components/      # Sidebar, MainPanel, RightPanel, citation UI
-│       ├── context/         # Bidirectional citation-highlight state
-│       └── hooks/           # useChatSession (SSE consumption), useTheme
-├── config/settings.py     # All env-overridable configuration, single source of truth
-├── deploy/huggingface/    # Space config, deploy guide, pre-ingested demo corpus
-├── scripts/deploy_hf_space.py
-├── Dockerfile             # Single image: node build stage + python runtime stage
-├── .github/workflows/ci.yml  # Backend tests+ruff, frontend lint+typecheck+build
-├── requirements-lock.txt  # Reproducible pinned deps (pip freeze), see Installation
-├── docs/
-│   ├── reviews/            # Dated pre-deploy code + security review logs
-│   └── user-testing/        # Dated live-testing session logs
-├── eval/                  # Hand-curated Q&A eval harness (sage-eval)
-└── tests/                 # 290 tests, no live Gemini required
-```
-
-## API reference
-
-| Method | Path | Purpose |
-|---|---|---|
-| `POST` | `/chat` | Non-streaming Q&A — answer + resolved citations in one response |
-| `POST` | `/chat/stream` | Same, as an SSE-formatted token stream (fetch + `ReadableStream` on the frontend, not `EventSource` — query/filters in the body, session token as a header) |
-| `POST` | `/conversations` | Start a new conversation, returns `conversation_id` + a session token |
-| `GET` | `/conversations` | List conversations belonging to the caller's session token |
-| `GET` | `/conversations/{id}` | Full message history for one conversation (session-scoped) |
-| `GET` | `/documents` | List ingested filings |
-| `POST` | `/documents/upload` | Upload a PDF (multipart) — 403s when `ALLOW_UPLOADS=false` |
-
-Both chat endpoints accept `top_k` in the JSON body (default `5`, allowed
-range `1`–`30`). For explicit comparisons it means the final chunk budget per
-normalized company; for single-company and unfiltered requests it is the
-global final chunk budget. Company filters are trimmed, case-insensitively
-deduplicated/canonicalized against corpus metadata, and limited to 10 entries.
-
-Real `POST /chat` response shape (trimmed):
-
-```json
-{
-  "schema_version": 1,
-  "answer": "Apple's total net sales for fiscal year 2025 were $416,161 million [1, 3].",
-  "citations": [
-    { "n": 1, "chunk_id": 49, "page_number": 48, "company": "Apple",
-      "fiscal_year": "FY25", "doc_type": "filing", "filename": "Apple_FY25_filing.pdf" }
-  ],
-  "model": "gemini-flash-lite-latest",
-  "latency_ms": { "retrieval_ms": 8201.5, "generation_ms": 7885.9, "total_ms": 25059.6 },
-  "tokens": { "prompt_tokens": 6692, "completion_tokens": 255, "total_tokens": 6947 },
-  "cache_hit": false,
-  "cost_usd": 0.0,
-  "session_id": null
-}
-```
-
-Comparison queries (`"companies": ["Apple", "Microsoft", "NVIDIA"]`) return a structured per-company answer with a closing comparison section, each company's claims independently citeable.
-
-## Configuration
-
-All settings live in `config/settings.py`, loaded via `python-dotenv` from a `.env` file at the repo root (never committed — see `.gitignore`).
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `GEMINI_API_KEY` | *(required)* | Generation is Gemini-only — nothing answers without this |
-| `GEMINI_CHAT_MODEL` | `gemini-flash-lite-latest` | Live-verified working when `gemini-flash-latest` hit a Google-side capacity issue |
-| `SAGE_EMBEDDING_MODEL` | `BAAI/bge-small-en-v1.5` | Local embedding model — changing this requires re-ingesting (`data/chroma/` vector dimensionality changes) |
-| `DEMO_ACCESS_KEY` | unset (no-op) | Gates `/chat`, `/conversations`, `/documents` behind a shared key on public deployments |
-| `VITE_DEMO_ACCESS_KEY` | unset | Build-time frontend counterpart to `DEMO_ACCESS_KEY` — must match, baked in at `npm run build` |
-| `ALLOW_UPLOADS` | `false` | Set `true` to allow `POST /documents/upload` — off by default (fail closed) so a deployment that forgets to set this doesn't accidentally expose an open PDF-upload service |
-| `MAX_UPLOAD_BYTES` | `26214400` (25MB) | Hard ceiling on a single upload's size, enforced while it streams to disk |
-| `MAX_UPLOAD_PAGES` | `500` | Hard ceiling on a single upload's page count, checked before ingestion |
-| `MAX_QUERY_LENGTH` | `2000` | Hard ceiling on a single chat query's character length |
-| `CHAT_RATE_LIMIT` | `10/minute` | `slowapi` rate-limit spec applied to `/chat`, `/chat/stream`, and uploads |
-
-## Installation
-
-Requires Python ≥3.11 and Node 20 for the frontend.
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-echo "GEMINI_API_KEY=your-key-here" > .env
-
-cd frontend
-npm ci
-npm run build   # produces frontend/dist, served by the same FastAPI process
-```
-
-For a reproducible install pinned to exact versions instead of `pyproject.toml`'s `>=` floors, use the committed lock file (`requirements-lock.txt`, generated via `pip freeze` — see its header comment for how to regenerate after a dependency change):
-
-```bash
-.venv/bin/pip install -r requirements-lock.txt
-.venv/bin/pip install -e . --no-deps
-```
+Sage exposes the same core pipeline through the browser, FastAPI endpoints, and the `sage` CLI. FastAPI's interactive API documentation is available at `/docs` while the server is running.
 
 ## Quick start
 
+### Prerequisites
+
+- Python 3.11
+- Node.js 20
+- A Gemini API key
+- Text-based SEC filing PDFs
+
+The filing PDFs and generated corpus are not distributed in this repository. Download the filings you want to research from SEC EDGAR and place them in `data/raw/`. Sage reads metadata from filenames using this convention:
+
+```text
+<Company>_<FiscalYear>_<DocumentType>.pdf
+```
+
+For the evaluated corpus:
+
+```text
+data/raw/Apple_FY25_filing.pdf
+data/raw/Microsoft_FY25_filing.pdf
+data/raw/NVIDIA_FY26_filing.pdf
+```
+
+### Install
+
 ```bash
-# ingest real filings
+git clone https://github.com/lakshayxi/sage.git
+cd sage
+
+python3.11 -m venv .venv
+.venv/bin/pip install -r requirements-lock.txt
+.venv/bin/pip install -e . --no-deps
+
+printf 'GEMINI_API_KEY=your-key-here\n' > .env
+
+cd frontend
+npm ci
+npm run build
+cd ..
+```
+
+### Ingest and run
+
+```bash
 .venv/bin/sage ingest --input-dir data/raw
-
-# ask from the CLI
-.venv/bin/sage ask "What was Apple's revenue in fiscal 2025?"
-
-# check retrieval/generation quality against the hand-curated eval set
-.venv/bin/sage-eval --limit 3
-
-# or run the full app
 .venv/bin/uvicorn api.main:app --reload
-# → open http://localhost:8000/
 ```
 
-## Usage examples
+Open [http://localhost:8000](http://localhost:8000). The local embedding and reranking models are downloaded from Hugging Face the first time they are loaded.
 
-Compare Mode from the CLI (repeat `--company` to trigger it):
+You can also query Sage directly from the CLI:
 
 ```bash
-.venv/bin/sage ask "Compare R&D spend trends" --company Apple --company Microsoft --company NVIDIA
+.venv/bin/sage ask \
+  "What was Apple's total net sales in fiscal year 2025?" \
+  --company Apple \
+  --fiscal-year FY25
 ```
 
-Streaming from the API (POST with a JSON body, not a query-string GET — see [Design decisions](#design-decisions)):
+Explicitly select each company to activate balanced comparison mode:
 
 ```bash
-curl -N -X POST http://localhost:8000/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"query": "How did NVIDIA'"'"'s gross margin change", "companies": ["NVIDIA"]}'
+.venv/bin/sage ask \
+  "Compare total annual revenue using each company's ingested fiscal-year filing." \
+  --company Apple \
+  --company Microsoft \
+  --company NVIDIA
 ```
 
-Resuming a conversation:
-
-```bash
-curl -X POST http://localhost:8000/conversations -d '{"title":"Apple FY25 deep dive"}' \
-  -H "Content-Type: application/json"
-# → {"conversation_id": 1, "session_token": "..."}
-
-curl http://localhost:8000/conversations/1 -H "X-Session-Token: <token from above>"
-```
-
-Running the test suite (no live Gemini/network required):
+### Test
 
 ```bash
 .venv/bin/python -m pytest tests/
-.venv/bin/ruff check . && .venv/bin/ruff format --check .
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+
+cd frontend
+npm run lint
+npm run test
+npm run build
 ```
 
-## Design decisions
+No Gemini key is needed for the test suite. A network connection is needed the first time the local BGE models are downloaded; subsequent runs can use the local model cache.
 
-**Embeddings run locally; generation doesn't.** Gemini's free embedding tier hit a hard, non-recoverable quota wall during development — and embeddings are needed on every single query (not just at ingest time), making that a structural risk rather than a one-off. Swapping to a local `sentence-transformers` model removed the risk entirely while keeping generation on Gemini, where the same problem never surfaced in practice.
+## Configuration
 
-**Queries get BGE's asymmetric instruction prefix; indexed passages don't.** `BAAI/bge-small-en-v1.5` is documented to benefit from a `"Represent this sentence for searching relevant passages: "` prefix on the query side only — passages stay unprefixed so already-indexed Chroma vectors remain valid without a re-ingest. `sage/embed/local_embedder.py`'s `embed_query()` applies the prefix and is used by retrieval and the semantic cache; ingestion still calls the unprefixed `embed_text()`/`embed_texts()`.
+Add `GEMINI_API_KEY` to `.env`. Advanced settings for model selection, uploads, caching, and rate limits are defined in [`config/settings.py`](config/settings.py).
 
-**Compare Mode gives each explicitly requested company its own retrieval and reranking budget, not a shared one.** An earlier version reranked all companies' candidates together against one shared `top_k`, then a later version grouped candidates but still filtered every company through one absolute cutoff. Full comparison wording can collapse valid `BAAI/bge-reranker-base` scores below 0.1, and its sigmoid outputs are not calibrated probabilities. Compare Mode now reuses original-query hybrid candidates, reranks once per requested company with a deterministic company-local fact query for recognized comparison shapes (otherwise the original query), keeps up to `top_k` chunks per company by rank, and refuses the whole comparison if any requested group is absent. Single-company and unfiltered behavior remains globally threshold-gated. `top_k` is validated from 1 through the configured 30-candidate rerank budget in the engine, CLI, and HTTP API. Company filters are trimmed, case-insensitively deduplicated, resolved to corpus metadata casing, and capped at 10 entries before per-company retrieval work begins.
+## Scope and limitations
 
-**Session isolation via an unguessable token, not a login system.** Conversations are scoped to a server-issued `secrets.token_urlsafe(32)` stored client-side, not a user account — enough to stop one visitor reading another's history on a public demo, without building auth for a single-operator portfolio project.
+- Balanced comparison mode depends on two or more companies being explicitly selected. Company names in free-text alone do not activate per-company retrieval.
+- Pre-generation refusals cover narrow company, fiscal-year, and named-segment checks. They do not prove that an arbitrary fact is absent from a filing, and vague questions can still be rejected by the ordinary reranking threshold.
+- Ingestion reads the PDF text layer with PyMuPDF. Scanned or image-only filings require OCR before Sage can use them.
+- Multi-turn generation receives conversation history, but retrieval runs against the latest question. Follow-ups should restate the financial metric instead of relying only on pronouns.
+- Upload ingestion is synchronous and disabled by default. The current Docker deployment directory contains a placeholder corpus; a deployer must ingest and package their own filings.
+- Generation requires Gemini. Embedding and reranking run locally, but their model weights must be downloaded before offline use.
 
-**Streaming is `fetch()` + `ReadableStream`, not `EventSource`.** The browser's native `EventSource` can only issue GET requests and can't set custom headers, which used to force the query text, session token, and demo access key into the `/chat/stream` URL's query string — leaking into server access logs, browser history, and any `Referer` header. `POST /chat/stream` now takes the query/filters as a JSON body and the session token as an `X-Session-Token` header, exactly like `POST /chat`, and the frontend reads the streamed response body incrementally instead of relying on the browser's SSE parser. `DemoKeyMiddleware` only accepts the key via the `X-Demo-Key` header now — no query-param fallback remains, since every client here is `fetch()`-based and can set real headers.
+## License
 
-**The demo access key is a casual-access deterrent, not a real secret.** `VITE_DEMO_ACCESS_KEY` is compiled into the public JS bundle by Vite at build time — anyone can read it straight out of the deployed site's own source, so it cannot be an authentication boundary. It exists to keep an unlisted demo URL out of casual crawler/scraper traffic, not to stop a deliberate actor; the actual defense against abuse of the costly Gemini-backed endpoints is `CHAT_RATE_LIMIT` (per-IP, applied to every chat and upload route). A deployment that needs real access control should put this app behind its own auth layer rather than treating `DEMO_ACCESS_KEY` as one.
-
-**Citation identity is positional, never taken from the model's own `chunk_id`.** The model is shown chunks labeled `[1]`, `[2]`, ... in the prompt and asked to cite bracket numbers; `_resolve_citations` (`sage/generation/answer_engine.py`) resolves `[n]` to `chunks[n - 1]` deterministically and ignores any `chunk_id` the model echoes back. Trusting the model's `chunk_id` would let a hallucinated or malformed value silently remap a visible `[1]` citation to a completely different retrieved chunk than the one actually shown as `[1]`.
-
-**Chunks never cross a page boundary.** Each page is chunked independently (`sage/ingest/chunker.py`), and a paragraph alone larger than `CHUNK_TOKENS` is split into bounded, overlapping windows rather than becoming one unbounded chunk. **No re-ingestion is required** for documents ingested before this fix — the schema didn't change, and existing chunks remain valid and citable — but any chunk that happened to span two pages under the old chunker keeps its (slightly imprecise) page attribution until that document is re-ingested.
-
-**Ingestion is idempotent via a content checksum, with compensating cleanup on failure.** `sage/ingest/pipeline.py` hashes the raw PDF and skips re-ingesting identical content already marked `ready`; if a failure happens after Chroma vectors were written but before the SQLite transaction commits, those specific vectors are deleted rather than left orphaned. Documents ingested before this fix have no checksum (`NULL`, backfilled automatically as a schema migration on next startup) and simply don't participate in dedup until re-ingested — never a false match. This doesn't fully serialize a genuine *concurrent* double-ingest of a brand-new file (a rare race for a synchronous, mostly-CLI/admin-driven operation, not hardened against here).
-
-## Known limitations
-
-- **Free Hugging Face Spaces have ephemeral storage** — conversations and cache writes on the public deployment don't survive a Space restart.
-- **The reranker model isn't baked into the deployment image** — it downloads from the HF Hub lazily on first use, so the first query after a cold start is noticeably slower than the rest.
-- **No OCR fallback** — PDF text extraction (PyMuPDF) is direct-text-layer only; scanned/image-only filings would extract little or no text.
-- **`MIN_RERANK_SCORE` (0.1) remains a heuristic for ordinary single-company/unfiltered queries** — it is not a calibrated answerability probability. Vague phrasing can still false-reject, while wrong-period or semantically adjacent nonexistent facts can score highly. Explicit comparison score collapse is handled separately; globally lowering the threshold was rejected because answerable and unanswerable score distributions overlap.
-- **Explicit comparison context scales as `requested companies × top_k`** — the default three-company request can send 15 chunks (the validated revenue-ranking prompt used 10,602 input tokens), although the caller scope is capped at 10 normalized companies. Company-local query decomposition is deterministic and intentionally limited to single-metric measured “Among…”, “Between…”, and filing-oriented “Compare…using each company’s…” forms; other or multi-metric grammar safely retains the original rerank query and may rank less well.
-- **Deterministic company/period/segment validation is deliberately narrow and lexical** — it handles corpus-canonical company casing, common possessive company names, explicit `FYxx`/`FYxxxx` and “fiscal year” forms, and singular `X [reportable|operating|business] segment` requests, but it is not a general entity linker or schema/ontology engine. Ticker aliases and category synonyms remain unsupported and may be conservatively refused.
-- **Uploads are synchronous, in-request ingestion** — there's no background job queue, so `MAX_UPLOAD_PAGES` exists specifically to bound how long a single upload request can take; a deployment expecting much larger filings than the 500-page default should raise it deliberately, aware that ingestion latency scales with it.
-
-## Security notes
-
-- Conversation history is session-token scoped (see [Design decisions](#design-decisions)) — cross-session reads 404 rather than leaking another visitor's data.
-- File upload sanitizes the filename to its basename and verifies the resolved destination path stays inside the intended upload directory before writing, rejecting path-traversal attempts.
-- Uploads are disabled by default (`ALLOW_UPLOADS=false`), streamed to disk in bounded chunks rather than fully buffered in memory, capped at `MAX_UPLOAD_BYTES`/`MAX_UPLOAD_PAGES`, and verified to actually be a readable PDF (not just named `*.pdf`) before ingestion — a rejected or failed upload is cleaned up rather than left behind in `data/raw/`.
-- `POST /documents/upload` is rate-limited and disabled outright (`403`) when `ALLOW_UPLOADS=false`, which is the default for every deployment, public or local, unless explicitly opted into.
-- There is no user-account authentication anywhere — `DEMO_ACCESS_KEY` is a shared, non-secret casual-access deterrent (it ships inside the public frontend bundle) for an entire deployment, not per-visitor identity or a real security boundary. The actual abuse defense is `CHAT_RATE_LIMIT`.
-
-## Quality & verification
-
-Real evidence, not just "tests pass":
-
-- **`docs/reviews/2026-07-18-pre-deploy-review.md`** — a structured, multi-agent code + security review of the full codebase before first deployment; 10 confirmed findings (including a conversation-history access-control gap), all fixed and independently re-verified.
-- **`docs/user-testing/user-testing.md`** — bugs surfaced by hand-driving the live app, including a real SSE stream-truncation bug and a config bug where `GEMINI_API_KEY` silently never loaded at runtime.
-- **`eval/` — a 19-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus. Numeric comparisons associate each expected figure with its company and require per-company source support; inline citation markers are also checked against the company whose amount they support. The exact long three-company ranking reproduction is included. The final 2026-07-20 uncached Python 3.11 live run passed **19/19** in 155.7s with answerable gold recall **15/15**, citation mapping/text support/inline company association **19/19**, and 85,616 total tokens (including clean zero-token refusals). Use repeatable `--id ITEM_ID` for targeted reruns.
-- **CI** (`.github/workflows/ci.yml`) — runs `pytest tests/`, `ruff check`/`format --check`, and the frontend's `oxlint` + `tsc` typecheck + `vite build` on every push/PR. Does not run `eval/run_eval.py` itself (live Gemini calls, real per-run cost, no offline mode).
-
-290 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
-
-## Deployment
-
-Single Docker image (frontend build stage + Python runtime stage) targeting a free Hugging Face Docker Space — chosen specifically for its 16GB RAM, which the cross-encoder reranker needs. The image is designed to bake in a pre-ingested demo corpus (Apple, Microsoft, and NVIDIA 10-Ks) so the public demo works with zero setup — as of this writing that corpus is still a placeholder and no Space has been deployed yet (see `deploy/huggingface/prebuilt/README.md`'s "Current status" and `deploy/huggingface/DEPLOY.md`'s "Prerequisites"). The app itself checks this at startup and logs a warning if it finds zero ingested documents (`api/main.py`), so an accidentally-empty deployment is visible in the Space's boot logs rather than only discoverable by trying a query by hand. Full walkthrough, required secrets, and rollback steps: [`deploy/huggingface/DEPLOY.md`](deploy/huggingface/DEPLOY.md).
-
-## Status
-
-Personal portfolio project — the public-facing half of a two-repo project. The research/experimentation half, where retrieval and generation techniques get proven before graduating here, lives at [Sage Research](https://github.com/lakshayxi/sage-research). Source-visible, not licensed for reuse — see [`LICENSE`](LICENSE) for why.
+This public repository is source-visible for portfolio and demonstration purposes, but it is not open-source licensed. The code is **All Rights Reserved** and reuse requires permission from the copyright holder. See [`LICENSE`](LICENSE).

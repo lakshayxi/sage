@@ -1,7 +1,6 @@
 import type { ChatResponse } from '../api/types'
 import { CitationCard } from './CitationCard'
 import { MetadataBar } from './MetadataBar'
-import { RelatedQuestions } from './RelatedQuestions'
 
 function SectionLabel({ children }: { children: string }) {
   return (
@@ -33,11 +32,6 @@ export function RightPanel({ result }: { result: ChatResponse | null }) {
             ))}
           </div>
         )}
-      </section>
-
-      <section className="space-y-2">
-        <SectionLabel>Related questions</SectionLabel>
-        <RelatedQuestions />
       </section>
 
       <section className="space-y-2">

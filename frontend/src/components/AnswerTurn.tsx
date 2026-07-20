@@ -1,5 +1,5 @@
 import type { ChatTurn } from '../hooks/useChatSession'
-import { renderAnswerText } from '../lib/renderAnswerText'
+import { AnswerMarkdown } from '../lib/renderAnswerText'
 
 export function AnswerTurn({ turn }: { turn: ChatTurn }) {
   const interactive = !turn.fromHistory
@@ -14,7 +14,7 @@ export function AnswerTurn({ turn }: { turn: ChatTurn }) {
         <p className="text-sm text-negative">{turn.errorMessage ?? 'Something went wrong.'}</p>
       ) : (
         <div className="space-y-3 text-[0.95rem] text-text">
-          {renderAnswerText(turn.answerText, interactive)}
+          <AnswerMarkdown text={turn.answerText} interactive={interactive} />
           {turn.status === 'streaming' && (
             <span
               aria-hidden="true"
