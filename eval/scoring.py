@@ -69,6 +69,7 @@ _REFUSAL_RE = re.compile("|".join(_REFUSAL_PATTERNS), re.IGNORECASE)
 # 5]"), page numbers, or the fiscal year itself ("2025").
 _NUMBER = r"[\d]{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+|\d+"
 _AMOUNT_RE = re.compile(rf"(\$\s*)?({_NUMBER})\s*(billion|bn|million|mn)?", re.IGNORECASE)
+_CITATION_MARKER_RE = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 
 def extract_amounts_millions(text: str) -> list[float]:
@@ -214,16 +215,78 @@ def citation_text_supports_expected(
     return all(checks)
 
 
+def citation_company_associations_valid(
+    item: EvalItem,
+    answer_text: str,
+    citation_filenames: list[str],
+    citation_texts: list[str],
+    citation_numbers: list[int],
+) -> bool:
+    """Tie each comparison claim's inline markers to that company's evidence.
+
+    Aggregate checks can prove that an answer contains the right amounts and
+    that its citation set contains the right source chunks while still
+    missing a damaging swap: Apple's amount marked with Microsoft's citation
+    and vice versa. This validates the association within each bounded company
+    section, using the resolved citation number rather than list position.
+    """
+    if not item.expected_company_amounts_millions:
+        return True
+    if not (len(citation_filenames) == len(citation_texts) == len(citation_numbers)):
+        return False
+
+    source_by_number = {
+        number: (filename, text)
+        for number, filename, text in zip(
+            citation_numbers, citation_filenames, citation_texts, strict=True
+        )
+    }
+    company_names = list(item.expected_company_amounts_millions)
+    lowered_answer = answer_text.lower()
+    for company, expected in item.expected_company_amounts_millions.items():
+        company_start = lowered_answer.find(company.lower())
+        if company_start < 0:
+            return False
+        company_end = min(len(answer_text), company_start + 600)
+        for other_company in company_names:
+            if other_company == company:
+                continue
+            position = lowered_answer.find(other_company.lower(), company_start + len(company))
+            if position >= 0:
+                company_end = min(company_end, position)
+
+        marker_numbers = {
+            int(number)
+            for marker in _CITATION_MARKER_RE.finditer(answer_text[company_start:company_end])
+            for number in marker.group(1).split(",")
+        }
+        expected_filename = COMPANY_FILENAMES.get(company)
+        if not any(
+            number in source_by_number
+            and source_by_number[number][0] == expected_filename
+            and source_text_contains_amount(source_by_number[number][1], expected)
+            for number in marker_numbers
+        ):
+            return False
+    return True
+
+
 @dataclass
 class ScoreResult:
     correct: bool
     grounded: bool
     text_supported: bool
     detail: str
+    citation_association_valid: bool = True
 
     @property
     def passed(self) -> bool:
-        return self.correct and self.grounded and self.text_supported
+        return (
+            self.correct
+            and self.grounded
+            and self.text_supported
+            and self.citation_association_valid
+        )
 
 
 def score_item(
@@ -231,6 +294,7 @@ def score_item(
     answer_text: str,
     citation_filenames: list[str],
     citation_texts: list[str] | None = None,
+    citation_numbers: list[int] | None = None,
 ) -> ScoreResult:
     """`citation_texts`, if given, is the text of each resolved citation
     (`Citation.text`) in the same order as `citation_filenames` -- used for
@@ -297,14 +361,30 @@ def score_item(
         if citation_texts is None
         else citation_text_supports_expected(item, citation_texts, citation_filenames)
     )
+    citation_association_valid = (
+        True
+        if citation_texts is None or citation_numbers is None
+        else citation_company_associations_valid(
+            item,
+            answer_text,
+            citation_filenames,
+            citation_texts,
+            citation_numbers,
+        )
+    )
     detail = (
         f"correct={correct} (expected_amount_millions={item.expected_amount_millions}, "
         f"expected_company_amounts_millions={item.expected_company_amounts_millions}, "
         f"expected_leader={item.expected_leader}, expected_periods={item.expected_periods}, "
         f"expected_keywords={item.expected_keywords}), "
         f"grounded={grounded} (citations={citation_filenames}, allowed={sorted(allowed)}), "
-        f"text_supported={text_supported}"
+        f"text_supported={text_supported}, "
+        f"citation_association_valid={citation_association_valid}"
     )
     return ScoreResult(
-        correct=correct, grounded=grounded, text_supported=text_supported, detail=detail
+        correct=correct,
+        grounded=grounded,
+        text_supported=text_supported,
+        detail=detail,
+        citation_association_valid=citation_association_valid,
     )

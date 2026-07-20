@@ -5,6 +5,7 @@ live-network tool and isn't exercised by this file or by `pytest tests/`)."""
 from eval.dataset import EvalItem
 from eval.scoring import (
     allowed_filenames_for,
+    citation_company_associations_valid,
     citation_text_supports_expected,
     extract_amounts_millions,
     keywords_match,
@@ -333,3 +334,65 @@ def test_comparison_scoring_associates_amount_below_markdown_company_heading():
     )
 
     assert result.correct
+
+
+def test_comparison_scoring_rejects_swapped_inline_company_citations():
+    item = EvalItem(
+        id="comparison",
+        question="q",
+        companies=["Apple", "Microsoft"],
+        expected_company_amounts_millions={
+            "Apple": 416_161.0,
+            "Microsoft": 281_724.0,
+        },
+    )
+    answer = (
+        "### Apple\nRevenue was $416,161 million [2].\n\n"
+        "### Microsoft\nRevenue was $281,724 million [1]."
+    )
+    filenames = ["Apple_FY25_filing.pdf", "Microsoft_FY25_filing.pdf"]
+    texts = ["Total net sales $ 416,161", "Total revenue $ 281,724"]
+
+    assert not citation_company_associations_valid(
+        item, answer, filenames, texts, citation_numbers=[1, 2]
+    )
+    result = score_item(
+        item,
+        answer,
+        filenames,
+        citation_texts=texts,
+        citation_numbers=[1, 2],
+    )
+    assert result.correct
+    assert result.grounded
+    assert result.text_supported
+    assert not result.citation_association_valid
+    assert not result.passed
+
+
+def test_comparison_scoring_accepts_matching_inline_company_citations():
+    item = EvalItem(
+        id="comparison",
+        question="q",
+        companies=["Apple", "Microsoft"],
+        expected_company_amounts_millions={
+            "Apple": 416_161.0,
+            "Microsoft": 281_724.0,
+        },
+    )
+    answer = (
+        "### Apple\nRevenue was $416,161 million [1].\n\n"
+        "### Microsoft\nRevenue was $281,724 million [2]."
+    )
+    filenames = ["Apple_FY25_filing.pdf", "Microsoft_FY25_filing.pdf"]
+    texts = ["Total net sales $ 416,161", "Total revenue $ 281,724"]
+
+    result = score_item(
+        item,
+        answer,
+        filenames,
+        citation_texts=texts,
+        citation_numbers=[1, 2],
+    )
+    assert result.citation_association_valid
+    assert result.passed

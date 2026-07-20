@@ -139,7 +139,7 @@ sage/
 │   ├── reviews/            # Dated pre-deploy code + security review logs
 │   └── user-testing/        # Dated live-testing session logs
 ├── eval/                  # Hand-curated Q&A eval harness (sage-eval)
-└── tests/                 # 261 tests, no live Gemini required
+└── tests/                 # 290 tests, no live Gemini required
 ```
 
 ## API reference
@@ -153,6 +153,12 @@ sage/
 | `GET` | `/conversations/{id}` | Full message history for one conversation (session-scoped) |
 | `GET` | `/documents` | List ingested filings |
 | `POST` | `/documents/upload` | Upload a PDF (multipart) — 403s when `ALLOW_UPLOADS=false` |
+
+Both chat endpoints accept `top_k` in the JSON body (default `5`, allowed
+range `1`–`30`). For explicit comparisons it means the final chunk budget per
+normalized company; for single-company and unfiltered requests it is the
+global final chunk budget. Company filters are trimmed, case-insensitively
+deduplicated/canonicalized against corpus metadata, and limited to 10 entries.
 
 Real `POST /chat` response shape (trimmed):
 
@@ -269,7 +275,7 @@ Running the test suite (no live Gemini/network required):
 
 **Queries get BGE's asymmetric instruction prefix; indexed passages don't.** `BAAI/bge-small-en-v1.5` is documented to benefit from a `"Represent this sentence for searching relevant passages: "` prefix on the query side only — passages stay unprefixed so already-indexed Chroma vectors remain valid without a re-ingest. `sage/embed/local_embedder.py`'s `embed_query()` applies the prefix and is used by retrieval and the semantic cache; ingestion still calls the unprefixed `embed_text()`/`embed_texts()`.
 
-**Compare Mode gives each explicitly requested company its own retrieval and reranking budget, not a shared one.** An earlier version reranked all companies' candidates together against one shared `top_k`, then a later version grouped candidates but still filtered every company through one absolute cutoff. Full comparison wording can collapse valid `BAAI/bge-reranker-base` scores below 0.1, and its sigmoid outputs are not calibrated probabilities. Compare Mode now reuses original-query hybrid candidates, reranks once per requested company with a deterministic company-local fact query for recognized comparison shapes (otherwise the original query), keeps up to `top_k` chunks per company by rank, and refuses the whole comparison if any requested group is absent. Single-company and unfiltered behavior remains globally threshold-gated. `top_k` is validated from 1 through the configured 30-candidate rerank budget.
+**Compare Mode gives each explicitly requested company its own retrieval and reranking budget, not a shared one.** An earlier version reranked all companies' candidates together against one shared `top_k`, then a later version grouped candidates but still filtered every company through one absolute cutoff. Full comparison wording can collapse valid `BAAI/bge-reranker-base` scores below 0.1, and its sigmoid outputs are not calibrated probabilities. Compare Mode now reuses original-query hybrid candidates, reranks once per requested company with a deterministic company-local fact query for recognized comparison shapes (otherwise the original query), keeps up to `top_k` chunks per company by rank, and refuses the whole comparison if any requested group is absent. Single-company and unfiltered behavior remains globally threshold-gated. `top_k` is validated from 1 through the configured 30-candidate rerank budget in the engine, CLI, and HTTP API. Company filters are trimmed, case-insensitively deduplicated, resolved to corpus metadata casing, and capped at 10 entries before per-company retrieval work begins.
 
 **Session isolation via an unguessable token, not a login system.** Conversations are scoped to a server-issued `secrets.token_urlsafe(32)` stored client-side, not a user account — enough to stop one visitor reading another's history on a public demo, without building auth for a single-operator portfolio project.
 
@@ -289,8 +295,8 @@ Running the test suite (no live Gemini/network required):
 - **The reranker model isn't baked into the deployment image** — it downloads from the HF Hub lazily on first use, so the first query after a cold start is noticeably slower than the rest.
 - **No OCR fallback** — PDF text extraction (PyMuPDF) is direct-text-layer only; scanned/image-only filings would extract little or no text.
 - **`MIN_RERANK_SCORE` (0.1) remains a heuristic for ordinary single-company/unfiltered queries** — it is not a calibrated answerability probability. Vague phrasing can still false-reject, while wrong-period or semantically adjacent nonexistent facts can score highly. Explicit comparison score collapse is handled separately; globally lowering the threshold was rejected because answerable and unanswerable score distributions overlap.
-- **Explicit comparison context scales as `requested companies × top_k`** — the default three-company request can send 15 chunks (the validated revenue-ranking prompt used 10,602 input tokens). Company-local query decomposition is deterministic and intentionally limited to measured “Among…”, “Between…”, and filing-oriented “Compare…using each company’s…” forms; other grammar safely retains the original rerank query and may rank less well.
-- **Deterministic period/segment validation is deliberately narrow and lexical** — it prevents a named fiscal year or singular `X segment` from being silently replaced by nearby evidence, but it is not a general schema/ontology engine. A filing that uses only a synonym for a requested category may be conservatively refused.
+- **Explicit comparison context scales as `requested companies × top_k`** — the default three-company request can send 15 chunks (the validated revenue-ranking prompt used 10,602 input tokens), although the caller scope is capped at 10 normalized companies. Company-local query decomposition is deterministic and intentionally limited to single-metric measured “Among…”, “Between…”, and filing-oriented “Compare…using each company’s…” forms; other or multi-metric grammar safely retains the original rerank query and may rank less well.
+- **Deterministic company/period/segment validation is deliberately narrow and lexical** — it handles corpus-canonical company casing, common possessive company names, explicit `FYxx`/`FYxxxx` and “fiscal year” forms, and singular `X [reportable|operating|business] segment` requests, but it is not a general entity linker or schema/ontology engine. Ticker aliases and category synonyms remain unsupported and may be conservatively refused.
 - **Uploads are synchronous, in-request ingestion** — there's no background job queue, so `MAX_UPLOAD_PAGES` exists specifically to bound how long a single upload request can take; a deployment expecting much larger filings than the 500-page default should raise it deliberately, aware that ingestion latency scales with it.
 
 ## Security notes
@@ -307,10 +313,10 @@ Real evidence, not just "tests pass":
 
 - **`docs/reviews/2026-07-18-pre-deploy-review.md`** — a structured, multi-agent code + security review of the full codebase before first deployment; 10 confirmed findings (including a conversation-history access-control gap), all fixed and independently re-verified.
 - **`docs/user-testing/user-testing.md`** — bugs surfaced by hand-driving the live app, including a real SSE stream-truncation bug and a config bug where `GEMINI_API_KEY` silently never loaded at runtime.
-- **`eval/` — a 19-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus. Numeric comparisons associate each expected figure with its company and require per-company source support; the exact long three-company ranking reproduction is included. The final 2026-07-20 uncached live run passed **19/19** in 86.7s with answerable gold recall **15/15**, answerable citation mapping **15/15**, and citation-text support **19/19** (including clean no-citation refusals). Use repeatable `--id ITEM_ID` for targeted reruns.
+- **`eval/` — a 19-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus. Numeric comparisons associate each expected figure with its company and require per-company source support; inline citation markers are also checked against the company whose amount they support. The exact long three-company ranking reproduction is included. The final 2026-07-20 uncached Python 3.11 live run passed **19/19** in 155.7s with answerable gold recall **15/15**, citation mapping/text support/inline company association **19/19**, and 85,616 total tokens (including clean zero-token refusals). Use repeatable `--id ITEM_ID` for targeted reruns.
 - **CI** (`.github/workflows/ci.yml`) — runs `pytest tests/`, `ruff check`/`format --check`, and the frontend's `oxlint` + `tsc` typecheck + `vite build` on every push/PR. Does not run `eval/run_eval.py` itself (live Gemini calls, real per-run cost, no offline mode).
 
-261 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
+290 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
 
 ## Deployment
 

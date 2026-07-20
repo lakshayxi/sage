@@ -142,7 +142,13 @@ def _run_item(item: EvalItem) -> dict:
 
     citation_filenames = [c.filename for c in result.citations]
     citation_texts = [c.text for c in result.citations]
-    score = score_item(item, result.answer_text, citation_filenames, citation_texts)
+    score = score_item(
+        item,
+        result.answer_text,
+        citation_filenames,
+        citation_texts,
+        [c.n for c in result.citations],
+    )
     gate_passed = len(result.retrieved_chunk_ids) > 0
     citation_mapping_valid = _citation_mapping_valid(result.retrieved_chunk_ids, result.citations)
 
@@ -158,12 +164,18 @@ def _run_item(item: EvalItem) -> dict:
         "cache_hit": result.cache_hit,
         "cost_usd": round(result.cost_usd, 6),
         "latency_ms": round(latency_ms, 1),
+        "retrieval_latency_ms": round(result.retrieval_latency_ms, 1),
+        "generation_latency_ms": round(result.generation_latency_ms, 1),
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+        "total_tokens": result.total_tokens,
         "recall_at_k": recall,
         "gate_passed": gate_passed,
         "citation_mapping_valid": citation_mapping_valid,
         "correct": score.correct,
         "grounded": score.grounded,
         "text_supported": score.text_supported,
+        "citation_association_valid": score.citation_association_valid,
         "passed": score.passed,
         "detail": score.detail,
     }
@@ -190,6 +202,11 @@ def _rate(rows: list[dict], key: str) -> str:
 def _write_markdown(path: Path, rows: list[dict], total_elapsed_s: float) -> None:
     passed = sum(1 for r in rows if r["passed"])
     total_cost = sum(r["cost_usd"] for r in rows)
+    total_prompt_tokens = sum(r["prompt_tokens"] for r in rows)
+    total_completion_tokens = sum(r["completion_tokens"] for r in rows)
+    total_tokens = sum(r["total_tokens"] for r in rows)
+    total_retrieval_ms = sum(r["retrieval_latency_ms"] for r in rows)
+    total_generation_ms = sum(r["generation_latency_ms"] for r in rows)
     cache_hits = sum(1 for r in rows if r["cache_hit"])
 
     lines = [
@@ -200,6 +217,10 @@ def _write_markdown(path: Path, rows: list[dict], total_elapsed_s: float) -> Non
         f"Total wall time: {total_elapsed_s:.1f}s",
         f"Cache hits: {cache_hits}/{len(rows)} (expected 0 -- use_cache=False every run)",
         f"Total estimated cost: ${total_cost:.6f}",
+        f"Retrieval latency sum: {total_retrieval_ms:.1f}ms",
+        f"Generation latency sum: {total_generation_ms:.1f}ms",
+        f"Tokens: {total_prompt_tokens} prompt + {total_completion_tokens} completion "
+        f"= {total_tokens} total",
         "",
         "## Aggregate retrieval/citation metrics",
         "",
@@ -207,18 +228,21 @@ def _write_markdown(path: Path, rows: list[dict], total_elapsed_s: float) -> Non
         f"- evidence selection passed: {_rate(rows, 'gate_passed')}",
         f"- citation number->chunk mapping valid: {_rate(rows, 'citation_mapping_valid')}",
         f"- citation text supports expected value: {_rate(rows, 'text_supported')}",
+        f"- inline citation company association valid: {_rate(rows, 'citation_association_valid')}",
         "",
         "## Per-item results",
         "",
         "| id | answerable | multi_turn | passed | correct | grounded | text_supported | "
-        "recall_at_k | gate_passed | citation_mapping_valid | latency_ms |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "citation_association_valid | recall_at_k | gate_passed | citation_mapping_valid | "
+        "latency_ms |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         lines.append(
             f"| {r['id']} | {r['answerable']} | {r['multi_turn']} | {r['passed']} | "
             f"{r['correct']} | {r['grounded']} | {r['text_supported']} | "
-            f"{r['recall_at_k']} | {r['gate_passed']} | {r['citation_mapping_valid']} | "
+            f"{r['citation_association_valid']} | {r['recall_at_k']} | "
+            f"{r['gate_passed']} | {r['citation_mapping_valid']} | "
             f"{r['latency_ms']} |"
         )
     lines.append("")
