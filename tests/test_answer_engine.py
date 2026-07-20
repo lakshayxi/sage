@@ -841,6 +841,40 @@ def test_explicit_out_of_corpus_company_refuses_before_generation(monkeypatch):
     assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
 
 
+@pytest.mark.parametrize("company", ["Tesla", "Amazon"])
+def test_filtered_out_of_corpus_company_refuses_before_generation(monkeypatch, company):
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", lambda *args, **kwargs: [])
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *args, **kwargs: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        f"What was {company}'s revenue in fiscal year 2025?",
+        companies=[company],
+        client=client,
+    )
+
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
+@pytest.mark.parametrize("company", ["Tesla", "Amazon"])
+def test_unfiltered_named_out_of_corpus_company_refuses_before_generation(monkeypatch, company):
+    apple = _fake_chunk(company="Apple", score=0.99)
+    apple.text = "Apple reported revenue in fiscal year 2025."
+    apple.fiscal_year = "FY25"
+    monkeypatch.setattr(answer_engine, "retrieve_hybrid", lambda *args, **kwargs: [apple])
+    monkeypatch.setattr(answer_engine, "rerank", lambda *args, **kwargs: [apple])
+    monkeypatch.setattr(answer_engine, "get_semantic_cached", lambda *args, **kwargs: None)
+
+    client = _FakeClient("should never be called")
+    result = answer_engine.generate_answer(
+        f"What was {company}'s revenue in fiscal year 2025?", client=client
+    )
+
+    assert client.calls["chat"] == 0
+    assert result.answer_text == NO_RELEVANT_CONTEXT_ANSWER
+
+
 def test_explicit_wrong_fiscal_year_scope_refuses_before_generation(monkeypatch):
     captured = {}
 
@@ -959,6 +993,23 @@ def test_scope_validation_rejects_period_missing_from_text_and_metadata():
     )
 
     assert reason == "requested_fiscal_year_not_in_evidence:2020"
+
+
+def test_scope_validation_defers_mixed_company_year_association_to_generation():
+    apple = _fake_chunk(company="Apple")
+    apple.text = "Apple fiscal year 2025 revenue."
+    apple.fiscal_year = "FY25"
+    nvidia = _fake_chunk(company="NVIDIA")
+    nvidia.text = "NVIDIA fiscal year 2026 revenue."
+    nvidia.fiscal_year = "FY26"
+
+    reason = answer_engine._unsupported_scope_reason(
+        "Compare Apple fiscal year 2025 revenue with NVIDIA fiscal year 2026 revenue.",
+        [apple, nvidia],
+        ["Apple", "NVIDIA"],
+    )
+
+    assert reason is None
 
 
 def test_explicit_comparison_citations_align_with_company_chunks(monkeypatch):

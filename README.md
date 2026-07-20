@@ -139,7 +139,7 @@ sage/
 │   ├── reviews/            # Dated pre-deploy code + security review logs
 │   └── user-testing/        # Dated live-testing session logs
 ├── eval/                  # Hand-curated Q&A eval harness (sage-eval)
-└── tests/                 # 256 tests, no live Gemini required
+└── tests/                 # 261 tests, no live Gemini required
 ```
 
 ## API reference
@@ -310,7 +310,7 @@ Real evidence, not just "tests pass":
 - **`eval/` — a 19-item retrieval-quality eval harness** (`.venv/bin/sage-eval`), scored deterministically against the real ingested Apple/Microsoft/NVIDIA corpus. Numeric comparisons associate each expected figure with its company and require per-company source support; the exact long three-company ranking reproduction is included. The final 2026-07-20 uncached live run passed **19/19** in 86.7s with answerable gold recall **15/15**, answerable citation mapping **15/15**, and citation-text support **19/19** (including clean no-citation refusals). Use repeatable `--id ITEM_ID` for targeted reruns.
 - **CI** (`.github/workflows/ci.yml`) — runs `pytest tests/`, `ruff check`/`format --check`, and the frontend's `oxlint` + `tsc` typecheck + `vite build` on every push/PR. Does not run `eval/run_eval.py` itself (live Gemini calls, real per-run cost, no offline mode).
 
-256 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
+261 tests (`tests/`) run with no live Gemini dependency — network-free fakes stand in for the Gemini client; retrieval, reranking, and embedding tests run against real local models.
 
 ## Deployment
 

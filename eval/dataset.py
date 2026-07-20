@@ -324,7 +324,11 @@ EVAL_ITEMS: list[EvalItem] = [
         question="Between Microsoft and NVIDIA, which had the higher net income?",
         companies=["Microsoft", "NVIDIA"],
         expected_answer=("NVIDIA ($120,067M) had higher net income than Microsoft ($101,832M)."),
-        expected_keywords=["NVIDIA"],
+        expected_company_amounts_millions={
+            "Microsoft": 101_832.0,
+            "NVIDIA": 120_067.0,
+        },
+        expected_leader="NVIDIA",
         history=[
             {
                 "role": "user",

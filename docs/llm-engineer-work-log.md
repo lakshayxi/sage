@@ -310,7 +310,7 @@ income), and 7.21s (full revenue ranking). Explicit Tesla/Amazon/FY20 filters se
 in 6.5–7.9ms. The exact live ranking completed in 7.63s (5.57s retrieval, 1.71s generation) and
 cited the correct Apple FY25, Microsoft FY25, and NVIDIA FY26 chunks.
 
-**Final validation:** 256 tests passed; Ruff lint/format and compileall passed. The final uncached
+**Final validation:** 261 tests passed; Ruff lint/format and compileall passed. The final uncached
 live eval, rerun after adding company/amount association scoring, passed 19/19 in 86.7s with
 answerable gold recall 15/15, answerable citation mapping 15/15, and citation-text support 19/19
 (including clean no-citation refusals). Generated eval reports remain ignored runtime artifacts.

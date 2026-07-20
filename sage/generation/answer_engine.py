@@ -72,6 +72,7 @@ COMPARISON_RANKING_CLAUSE_RE = re.compile(
     r"[,;]?\s*(?:then\s+)?rank(?:ing)?\b.*\Z", re.IGNORECASE | re.DOTALL
 )
 REQUESTED_FISCAL_YEAR_RE = re.compile(r"\bfiscal\s+year\s+(?:fy)?(20\d{2}|\d{2})\b", re.I)
+REQUESTED_POSSESSIVE_COMPANY_RE = re.compile(r"\b([A-Z][A-Za-z0-9.&-]*)['’]s\b")
 REQUESTED_SEGMENT_RE = re.compile(r"\b([a-z][a-z0-9&-]*)\s+(?:business\s+)?segment\b", re.I)
 GENERIC_SEGMENT_WORDS = {"a", "any", "business", "operating", "reportable", "the", "what", "which"}
 
@@ -486,7 +487,22 @@ def _unsupported_scope_reason(
         else [(None, chunks)]
     )
 
-    for year_match in REQUESTED_FISCAL_YEAR_RE.finditer(query):
+    # For an unfiltered singular possessive query ("Tesla's revenue"), a
+    # company absent from every selected chunk is deterministically outside
+    # the evidence scope. This is deliberately narrow, not general-purpose
+    # company entity recognition.
+    if len(requested_companies) < 2:
+        evidence_companies = {chunk.company.lower() for chunk in chunks if chunk.company}
+        for company_match in REQUESTED_POSSESSIVE_COMPANY_RE.finditer(query):
+            named_company = company_match.group(1)
+            if named_company.lower() not in evidence_companies:
+                return f"requested_company_not_in_evidence:{named_company}"
+
+    year_matches = list(REQUESTED_FISCAL_YEAR_RE.finditer(query))
+    # Multiple years may be independently scoped ("Apple FY25 vs NVIDIA
+    # FY26"); leave that association to generation rather than requiring
+    # every year in every company group.
+    for year_match in year_matches if len(year_matches) == 1 else []:
         year = year_match.group(1)
         full_year = f"20{year}" if len(year) == 2 else year
         short_year = full_year[-2:]
@@ -504,7 +520,8 @@ def _unsupported_scope_reason(
                 suffix = f":{company}" if company else ""
                 return f"requested_fiscal_year_not_in_evidence:{full_year}{suffix}"
 
-    for segment_match in REQUESTED_SEGMENT_RE.finditer(query):
+    segment_matches = list(REQUESTED_SEGMENT_RE.finditer(query))
+    for segment_match in segment_matches if len(segment_matches) == 1 else []:
         label = segment_match.group(1).lower()
         meaningful_words = [word for word in label.split() if word not in GENERIC_SEGMENT_WORDS]
         if not meaningful_words:
