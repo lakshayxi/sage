@@ -1,141 +1,88 @@
 # Deploying Sage to Hugging Face Spaces
 
-Target: a single Docker Space (free CPU tier, 16GB RAM) serving both the
-API and the built frontend from one FastAPI process, one URL. No other
-deployment target exists for this repo — this is the only path.
+Sage ships as one Docker Space: Vite builds the frontend, FastAPI serves the
+static application and API on port 7860, and the clean 3-filing corpus is baked
+into the image. Check Hugging Face's current Docker Space eligibility and
+hardware pricing before creating the Space.
 
-## Prerequisites (not yet done as of this writing)
+## 1. Create and configure the Space
 
-1. **Real ingested demo data** in `deploy/huggingface/prebuilt/` (currently
-   placeholders — see `deploy/huggingface/prebuilt/README.md`). The Space
-   will build and run without this, it'll just answer from an empty corpus.
-2. **A Hugging Face account and an empty Docker Space** created at
-   `huggingface.co/new-space` (SDK: Docker) to push to.
-3. **The frontend (`frontend/`) built and committed** — this Dockerfile's
-   first stage runs `npm ci && npm run build` against it.
+Create an empty Space with the **Docker** SDK. In **Settings → Variables and
+secrets**, configure:
 
-## One-time Space configuration
+| Name | Type | Required | Purpose |
+|---|---|---:|---|
+| `GEMINI_API_KEY` | Secret | Yes | Gemini answer generation. |
+| `GEMINI_CHAT_MODEL` | Variable | No | Defaults to the pinned `gemini-3.5-flash-lite`. |
+| `ALLOW_UPLOADS` | Variable | No | Leave unset/`false` for the curated public demo. |
+| `CHAT_RATE_LIMIT` | Variable | No | Shared `/chat` + `/chat/stream` limit; default `10/minute` per client IP. |
+| `CONVERSATION_RATE_LIMIT` | Variable | No | Conversation-create limit; default `10/minute`. |
+| `MAX_CONCURRENT_GENERATIONS` | Variable | No | Process-wide expensive-work cap; default `2`. |
+| `CORS_ORIGINS` | Variable | No | Leave empty for the same-origin Space frontend. |
 
-In the Space's **Settings → Variables and secrets**, set:
+`DEMO_ACCESS_KEY` is only a casual deterrent, not authentication, because a
+browser client must receive the same value. The published image deliberately
+does not compile one into its JavaScript. Leave it unset for this recruiter
+demo and rely on request bounds, shared generation throttling, the global
+concurrency cap, Gemini project quotas, and monitoring.
 
-| Name | Type | Required | Notes |
-|---|---|---|---|
-| `GEMINI_API_KEY` | Secret | Yes | Generation is Gemini-only — nothing answers without this. (Embeddings run locally, not via Gemini.) |
-| `DEMO_ACCESS_KEY` | Secret | Recommended | Gates `/chat`, `/conversations`, `/documents` behind an `X-Demo-Key` header (`api/middleware.py`). Leave unset only if the demo is meant to be fully open. |
-| `ALLOW_UPLOADS` | Variable | No — leave unset | Curated-demo boundary: `POST /documents/upload` 403s instead of accepting arbitrary PDFs from the public internet. Defaults to `false` (disabled) if unset, which is exactly what this deployment wants — only set it to `true` if this Space is deliberately meant to accept public uploads. |
-| `CHAT_RATE_LIMIT` | Variable | Optional | slowapi rate-limit spec (default `10/minute`) applied to `/chat` and `/chat/stream`, protecting the shared Gemini quota behind a public URL. |
+Never commit real keys. The deployment corpus is already scrubbed of local
+queries, caches, conversations, and session tokens.
 
-These map directly to `config/settings.py`'s `os.environ.get(...)` calls — no
-other wiring is needed; HF injects both Variables and Secrets as container
-environment variables at runtime (confirmed against
-huggingface.co/docs/hub/spaces-sdks-docker, "Secrets and Variables
-Management" → Runtime).
-
-**Never commit real values for any of these** — set them only in the
-Space's Settings UI.
-
-### `DEMO_ACCESS_KEY` also needs `VITE_DEMO_ACCESS_KEY` at *build* time
-
-If `DEMO_ACCESS_KEY` is set, the frontend must be built with a matching
-`VITE_DEMO_ACCESS_KEY` so it can actually supply the key back — as an
-`X-Demo-Key` header on every request to `/chat`, `/chat/stream`,
-`/conversations`, and `/documents` (see `api/middleware.py` and
-`frontend/src/api/session.ts`'s `demoKeyHeaders()`). Without this, setting
-only `DEMO_ACCESS_KEY` locks the deployed frontend out of its own API.
-
-Note that `VITE_DEMO_ACCESS_KEY` is not a real secret once it's built into
-the frontend — Vite inlines it into the public JS bundle, so anyone can
-read it out of the deployed site's own source (see
-`api/middleware.py`'s module docstring). It's a casual-access deterrent,
-not an auth boundary; treat the deployment as effectively public and rely
-on `CHAT_RATE_LIMIT` for abuse protection regardless of whether this is set.
-
-Vite inlines `VITE_*` vars into the built JS at build time, not runtime, so
-this can't be set as a Space Secret/Variable the way `DEMO_ACCESS_KEY`
-is — those only become container environment variables *after* the image
-is already built. The Dockerfile's frontend-build stage accepts it as a
-build-arg (`ARG VITE_DEMO_ACCESS_KEY`), but **HF Spaces' own Docker build
-does not accept custom `--build-arg` values** (Secrets/Variables are
-runtime-only there). Until this deployment has its own CI/build pipeline,
-setting a real `DEMO_ACCESS_KEY` on this Space means building and pushing
-the image yourself instead of letting HF build it from source:
+## 2. Validate and deploy
 
 ```bash
-docker build --build-arg VITE_DEMO_ACCESS_KEY=<same value as DEMO_ACCESS_KEY> -t <your-image> .
+.venv/bin/python scripts/build_demo_corpus.py
+.venv/bin/python scripts/deploy_hf_space.py \
+  --repo-id <your-username>/sage \
+  --dry-run
+
+# Requires an HF_TOKEN with write access. This mutates the live Space.
+.venv/bin/python scripts/deploy_hf_space.py \
+  --repo-id <your-username>/sage \
+  --push
 ```
 
-then push `<your-image>` to the Space's registry per HF's Docker Spaces
-docs, rather than using `scripts/deploy_hf_space.py --push` (which uploads
-source for HF to build itself, with no build-arg). If this key isn't set at
-all, skip this section entirely — the demo stays fully open.
+The dry run refuses an empty, inconsistent, or privacy-contaminated corpus.
+It stages only the Docker build inputs, lockfile, application source, frontend,
+Space README, and prebuilt corpus. `--push` uploads that staging directory and
+triggers the Space build.
 
-## Deploying
+Both local models are pinned to immutable Hugging Face revisions and downloaded
+at image-build time. Runtime starts in Hugging Face/Transformers offline mode,
+warms both models before reporting ready, and does not make the first visitor
+wait on model downloads.
+
+The production image disables durable query logging and stores only a digest of
+each anonymous browser session token. Runtime answer caches remain ephemeral and
+are never copied back into the committed corpus.
+
+## 3. Verify the live deployment
+
+Replace `<space-host>` with the generated `*.hf.space` host:
 
 ```bash
-.venv/bin/python scripts/deploy_hf_space.py --repo-id <your-username>/sage --push
+curl -i https://<space-host>/healthz
+curl -i https://<space-host>/readyz
+curl -i https://<space-host>/documents
 ```
 
-This stages `api/`, `sage/`, `config/`, `frontend/` (source, not `dist/` —
-the Space builds it itself from the Dockerfile), `deploy/huggingface/prebuilt/`,
-`pyproject.toml`, `Dockerfile`, and `.dockerignore` into a temp folder,
-renames `deploy/huggingface/README.md` to that folder's `README.md` (the
-file HF reads for the Space's YAML config), and uploads it via
-`huggingface_hub`'s `HfApi().upload_folder(...)`. Omit `--push` (or pass
-`--dry-run` explicitly) to only print what would be uploaded without
-contacting the Hub — do this first.
+Expected results:
 
-HF then builds the `Dockerfile` server-side. Watch the build in the Space's
-**Logs** tab; a Docker CPU-tier build of this image (torch +
-sentence-transformers + a frontend npm build) can take several minutes.
+- `/healthz`: `200 {"status":"ok"}`.
+- `/readyz`: `200` with `documents: 3`; `503` means the corpus or model warmup
+  is not ready.
+- `/documents`: three ready filings.
+- The root URL loads the UI, a sample prompt streams an answer, citation cards
+  expand, and each curated filing offers an SEC source link.
 
-**This pushes to a shared, public HF repo and (re)deploys the live Space —
-confirm with the user before running with `--push` for real.**
+Also inspect the Space build/runtime logs and make one real Apple, Microsoft,
+and three-company comparison query before sharing the URL.
 
-## Verifying after deploy
+## Rollback and persistence
 
-1. Space status shows **Running** (not "Build error" / "Runtime error") in
-   the Space UI.
-2. `curl -s -o /dev/null -w '%{http_code}\n' https://<your-username>-sage.hf.space/documents`
-   returns `200` (or `401` if `DEMO_ACCESS_KEY` is set and no header was
-   sent — either confirms the app is actually serving, not crash-looping).
-3. Open `https://<your-username>-sage.hf.space/` in a browser — the built
-   frontend should load (confirms the `StaticFiles` mount in `api/main.py`
-   is serving `frontend/dist` correctly), and a real query against the demo
-   corpus returns a cited answer.
-4. Tail the Space's **Logs** tab for a few minutes after first traffic —
-   confirms no repeated tracebacks on real requests.
-
-## Rollback
-
-HF Spaces keeps every previous commit to the Space's git repo. To roll back:
-
-- **Via UI**: Space → **Files and versions** → find the last known-good
-  commit → **Revert**. HF rebuilds and redeploys automatically from that
-  commit.
-- **Via git**: `git -C <space-repo-clone> revert <bad-commit>` then
-  `git push`, or reset to a known-good commit and force-push (HF Spaces
-  repos are single-branch deployment targets, not shared collaborative
-  history, so a force-push here doesn't carry the usual shared-branch
-  risk — but confirm this is really a Space-only clone, not this project's
-  own repo, before force-pushing anything).
-- Since the demo corpus is baked into the image rather than mounted from
-  persistent storage, a rollback also rolls back the data — there's no
-  separate "bad code, good data" split to worry about.
-
-## Known limitations
-
-- **Free Spaces have ephemeral container storage.** Anything written at
-  runtime (new conversations in `db/sage.db`, cache writes) is lost on
-  every Space restart/rebuild — expected and acceptable for a stateless
-  public demo; don't treat this deployment as durable storage for
-  conversation history.
-- **No persistent-storage add-on is configured** (paid HF feature) — not
-  needed here since the whole point is a fixed, baked-in demo corpus, not
-  live ingestion.
-- **The cross-encoder reranker model (`BAAI/bge-reranker-base`) is not baked
-  into the image** — `sage/retrieval/reranker.py` downloads it from the HF
-  Hub lazily on first use and caches it under `$HOME/.cache/huggingface`
-  (writable by `appuser`). Expect the *first* query after a cold start to be
-  noticeably slower than subsequent ones; this also means the container
-  needs outbound network access at runtime, not just at build time (true by
-  default on HF Spaces).
+Use **Files and versions → Revert** in the Space UI to restore the previous
+Space commit; this rebuilds code and baked data together. Container storage is
+ephemeral, so runtime conversations and caches may disappear after a restart.
+That is intentional for this anonymous portfolio demo. Uploads remain disabled
+and the committed corpus remains the source of truth.

@@ -28,6 +28,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from build_demo_corpus import validate_demo_corpus
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Everything the Space's Dockerfile needs to build + run, and nothing else
@@ -37,6 +39,7 @@ FILES_TO_STAGE = [
     "Dockerfile",
     ".dockerignore",
     "pyproject.toml",
+    "requirements-lock.txt",
 ]
 DIRS_TO_STAGE = [
     "api",
@@ -62,6 +65,10 @@ def _ignore(_dir: str, names: list[str]) -> set[str]:
 def stage(staging_dir: Path) -> list[Path]:
     """Copy everything the Space needs into staging_dir. Returns the list of
     top-level paths staged, for the dry-run summary."""
+    prebuilt = REPO_ROOT / "deploy" / "huggingface" / "prebuilt"
+    documents, chunks = validate_demo_corpus(prebuilt / "sage.db", prebuilt / "chroma")
+    print(f"Validated demo corpus: {documents} documents, {chunks} chunks")
+
     staged: list[Path] = []
 
     for rel in FILES_TO_STAGE:
@@ -106,11 +113,17 @@ def main() -> int:
         required=True,
         help="Target Space, e.g. 'yourname/sage'.",
     )
-    parser.add_argument(
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
         "--push",
         action="store_true",
         help="Actually upload to the Hub. Without this flag, only stages "
         "locally and prints what would be uploaded.",
+    )
+    action.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Stage and validate locally without uploading (the default).",
     )
     parser.add_argument(
         "--commit-message",

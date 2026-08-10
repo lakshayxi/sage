@@ -63,6 +63,26 @@ def test_rerank_returns_empty_for_no_candidates(monkeypatch):
     assert reranker.rerank("query", [], top_k=5) == []
 
 
+def test_get_model_pins_the_configured_revision(monkeypatch):
+    received = {}
+
+    class FakeCrossEncoder:
+        def __init__(self, model_name, *, revision):
+            received.update(model_name=model_name, revision=revision)
+
+    monkeypatch.setattr(reranker, "_model", None)
+    monkeypatch.setattr(reranker, "CrossEncoder", FakeCrossEncoder)
+
+    first = reranker._get_model()
+    second = reranker._get_model()
+
+    assert first is second
+    assert received == {
+        "model_name": "BAAI/bge-reranker-base",
+        "revision": "2cfc18c9415c912f9d8155881c133215df768a70",
+    }
+
+
 def test_rerank_query_variants_do_not_overwrite_prior_results(monkeypatch):
     chunks = [_make_chunk(1, "first", score=0.25), _make_chunk(2, "second", score=0.5)]
 

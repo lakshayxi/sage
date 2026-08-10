@@ -5,7 +5,7 @@ colorFrom: green
 colorTo: blue
 sdk: docker
 app_port: 7860
-pinned: false
+pinned: true
 short_description: Ask questions about Apple, Microsoft, and NVIDIA's latest 10-K filings.
 ---
 
@@ -34,12 +34,6 @@ anyone trying it.
 See `deploy/huggingface/DEPLOY.md` in the source repo for how this Space is
 built and deployed.
 
-<!--
-Deployer checklist before this file goes live as the Space's actual README:
-the "pre-loaded" claim above is only true once the real corpus has replaced
-the placeholder in deploy/huggingface/prebuilt/ (see that directory's
-README's "Current status") and the image has been rebuilt from it. The
-running app itself also checks this at startup and logs a warning if
-db/sage.db still has zero ingested documents (api/main.py) -- check the
-Space's Logs tab after first deploy to confirm the warning is absent.
--->
+The image includes a privacy-scrubbed 3-document, 421-chunk corpus. Uploads are
+disabled, local retrieval models are preloaded, and `/readyz` verifies that a
+usable filing corpus is available before the container reports ready.

@@ -1,4 +1,6 @@
-.venv/
+.venv*/
+.DS_Store
+backups/
 __pycache__/
 *.pyc
 .pytest_cache/

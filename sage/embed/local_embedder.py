@@ -70,7 +70,10 @@ def _get_model() -> SentenceTransformer:
         # discard) their own full model.
         with _model_lock:
             if _model is None:
-                _model = SentenceTransformer(settings.LOCAL_EMBEDDING_MODEL)
+                _model = SentenceTransformer(
+                    settings.LOCAL_EMBEDDING_MODEL,
+                    revision=settings.LOCAL_EMBEDDING_REVISION,
+                )
     return _model
 
 

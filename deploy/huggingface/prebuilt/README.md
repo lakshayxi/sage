@@ -1,53 +1,29 @@
 # Pre-ingested demo corpus
 
-This directory is baked into the Hugging Face Space image unconditionally
-(see the root `Dockerfile`) so the public demo works with zero setup —
-no upload step, no ingestion wait, no `GEMINI_API_KEY`-backed ingestion call
-on first visit.
+This directory contains the deployment-ready Apple FY2025, Microsoft FY2025,
+and NVIDIA FY2026 corpus baked into the Docker image:
 
-## What goes here
+- `sage.db`: 3 ready documents and 421 source chunks.
+- `chroma/`: the matching 421 embeddings in the `sage_chunks` collection.
 
-- `chroma/` — a full copy of a `data/chroma/` Chroma persistent-client
-  directory (the `sage_chunks` and `sage_query_cache` collections) produced
-  by running `sage ingest` locally against the demo PDFs (Apple, Microsoft,
-  and NVIDIA's latest 10-Ks).
-- `sage.db` — the matching SQLite database (`db/sage.db`) from that same
-  ingest run: `Document`/`Chunk` rows the Chroma vectors point back into,
-  plus (optionally) any warmed query-cache rows.
+The artifact intentionally contains no conversations, messages, session
+tokens, query logs, exact-answer cache, or semantic-answer cache. Those tables
+exist in SQLite for runtime use but are empty in the committed copy.
 
-Both **must** come from the same ingest run — Chroma only stores vectors and
-filter metadata, SQLite is the source of truth for chunk text (see
-`CLAUDE.md`'s architecture notes in the reference project this pattern is
-borrowed from); mismatched copies will retrieve vectors whose chunk text no
-longer exists, or vice versa.
+## Rebuild safely
 
-## Current status
-
-Placeholder only. `chroma/` currently holds just a `.gitkeep`, and `sage.db`
-is a 0-byte file (a valid, empty SQLite database — Chroma/SQLAlchemy both
-open it fine, it just has no data). This is intentional: it lets the
-Dockerfile's `COPY` steps succeed unconditionally, whether or not the real
-data has landed yet, so the image always builds — it just serves an empty
-corpus until the real files replace these placeholders.
-
-Generating the real data isn't blocked on a Gemini quota issue anymore —
-embeddings now run locally (`sage/embed/local_embedder.py`), so `sage ingest`
-makes no Gemini calls at all. The only remaining blocker is that nobody has
-run the three-command sequence below yet.
-
-## How to (re)generate this
-
-From the repo root, with `GEMINI_API_KEY` set and quota available:
+After ingesting or changing the local corpus, run:
 
 ```bash
-.venv/bin/sage ingest data/raw/apple-10k.pdf --company Apple --fiscal-year 2025 --doc-type 10-K
-.venv/bin/sage ingest data/raw/microsoft-10k.pdf --company Microsoft --fiscal-year 2025 --doc-type 10-K
-.venv/bin/sage ingest data/raw/nvidia-10k.pdf --company NVIDIA --fiscal-year 2025 --doc-type 10-K
-
-rm -rf deploy/huggingface/prebuilt/chroma
-cp -r data/chroma deploy/huggingface/prebuilt/chroma
-cp db/sage.db deploy/huggingface/prebuilt/sage.db
+.venv/bin/python scripts/build_demo_corpus.py
+.venv/bin/python scripts/deploy_hf_space.py --repo-id <username>/sage --dry-run
 ```
 
-Then rebuild the image (`docker build .`) and spot-check a query against the
-container before pushing to the Space — see `deploy/huggingface/DEPLOY.md`.
+The exporter uses a SQLite backup, removes private runtime rows, copies only
+the chunk collection into a fresh Chroma store, and validates that every
+SQLite embedding ID has exactly one matching Chroma ID before atomically
+replacing this directory.
+
+Do not copy `db/sage.db` or `data/chroma/` here by hand. Development stores
+contain private query text and opaque browser session tokens, and separately
+copied stores can point at different chunk sets.

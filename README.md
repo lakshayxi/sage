@@ -91,11 +91,11 @@ This requires the same three filings, a valid `GEMINI_API_KEY`, and live Gemini 
 
 ## Engineering quality
 
-**290 backend tests pass under Python 3.11.** They cover ingestion deduplication and rollback, page-safe chunking, hybrid and balanced retrieval, reranking, scope refusals, citation integrity, exact and semantic caching, shared streaming/non-streaming retrieval and citation behavior, API validation, upload limits, rate limiting, and conversation isolation. Gemini is replaced with network-free fakes in the test suite; the local embedding and reranking models download from Hugging Face on first use.
+**300+ backend tests pass under Python 3.11.** They cover ingestion deduplication and rollback, page-safe chunking, hybrid and balanced retrieval, reranking, scope refusals, citation integrity, exact and semantic caching, shared streaming/non-streaming retrieval and citation behavior, API validation, upload limits, rate limiting, bounded anonymous history, deployment-corpus privacy checks, and conversation isolation. Gemini is replaced with network-free fakes in the test suite; the local embedding and reranking models download from Hugging Face on first use.
 
-The frontend test suite covers stream parsing, Markdown rendering, grouped citations, and right-panel behavior, alongside Oxlint, TypeScript checks, and a production Vite build. CI installs the Python 3.11 dependency lock, runs the backend tests and Ruff checks, then runs the frontend lint, tests, typecheck, and build.
+The 31-test frontend suite covers stream parsing, aborting generation, Markdown rendering, fiscal-year labels, curated SEC source links, sample prompts, and citation-panel behavior, alongside Oxlint, TypeScript checks, and a production Vite build. CI installs the Python 3.11 dependency lock, runs the backend tests and Ruff checks, then runs the frontend lint, tests, typecheck, and build.
 
-The deployment path is a single CPU-only Docker image that builds the frontend and serves it with FastAPI. The committed image currently requires a corpus to be ingested and packaged before deployment.
+The deployment path is a single CPU-only Docker image that builds the frontend and serves it with FastAPI. It includes a validated, privacy-scrubbed 3-document/421-chunk corpus and preloads pinned local-model revisions during the image build. Liveness and corpus-aware readiness endpoints support deployment checks.
 
 ## Product surface
 
@@ -105,11 +105,11 @@ The deployment path is a single CPU-only Docker image that builds the frontend a
 | API | FastAPI with validated JSON and streamed responses |
 | Retrieval | BM25 + BGE vector search, reciprocal rank fusion |
 | Reranking | Local `BAAI/bge-reranker-base` cross-encoder |
-| Generation | Gemini via `google-genai` |
+| Generation | Pinned `gemini-3.5-flash-lite` via `google-genai` |
 | Storage | SQLite for source text and application state; Chroma for vectors |
 | Caching | TTL-based exact and semantic answer caches |
 | Ingestion | PyMuPDF, page-local overlapping chunks, SHA-256 deduplication |
-| Deployment | Multi-stage, CPU-only Docker image; corpus supplied by the deployer |
+| Deployment | Multi-stage CPU Docker image with a clean prebuilt demo corpus |
 
 Sage exposes the same core pipeline through the browser, FastAPI endpoints, and the `sage` CLI. FastAPI's interactive API documentation is available at `/docs` while the server is running.
 
@@ -122,7 +122,7 @@ Sage exposes the same core pipeline through the browser, FastAPI endpoints, and 
 - A Gemini API key
 - Text-based SEC filing PDFs
 
-The filing PDFs and generated corpus are not distributed in this repository. Download the filings you want to research from SEC EDGAR and place them in `data/raw/`. Sage reads metadata from filenames using this convention:
+The original filing PDFs are not distributed in this repository. A clean generated corpus for the three evaluated filings is committed only for the public demo image. To ingest a different local corpus, download text-based filings from SEC EDGAR and place them in `data/raw/`. Sage reads metadata from filenames using this convention:
 
 ```text
 <Company>_<FiscalYear>_<DocumentType>.pdf
@@ -146,7 +146,8 @@ python3.11 -m venv .venv
 .venv/bin/pip install -r requirements-lock.txt
 .venv/bin/pip install -e . --no-deps
 
-printf 'GEMINI_API_KEY=your-key-here\n' > .env
+cp .env.example .env
+# Add your GEMINI_API_KEY to .env.
 
 cd frontend
 npm ci
@@ -197,9 +198,40 @@ npm run build
 
 No Gemini key is needed for the test suite. A network connection is needed the first time the local BGE models are downloaded; subsequent runs can use the local model cache.
 
+## Deploy
+
+The safe deployment workflow validates that the baked corpus is non-empty,
+internally consistent, and contains no development queries, caches,
+conversations, messages, or session tokens:
+
+```bash
+.venv/bin/python scripts/build_demo_corpus.py
+.venv/bin/python scripts/deploy_hf_space.py \
+  --repo-id <your-username>/sage \
+  --dry-run
+```
+
+After creating and configuring a Docker Space, repeat the command with
+`--push`. That action uploads to and rebuilds a live external service, so it
+is intentionally never part of local setup or CI. See the complete
+[Hugging Face deployment runbook](deploy/huggingface/DEPLOY.md).
+
 ## Configuration
 
-Add `GEMINI_API_KEY` to `.env`. Advanced settings for model selection, uploads, caching, and rate limits are defined in [`config/settings.py`](config/settings.py).
+Copy [`.env.example`](.env.example), add `GEMINI_API_KEY`, and keep the real `.env` uncommitted. Advanced settings for model selection, uploads, caching, CORS, anonymous-history retention, and request/rate limits are defined in [`config/settings.py`](config/settings.py).
+
+For a public demo, uploads fail closed, ordinary JSON bodies and session
+headers are bounded before database work, `/chat` and `/chat/stream` share one
+rate-limit bucket, conversation creation has a separate limit, and old anonymous
+history is pruned automatically. A process-wide generation cap rejects excess
+simultaneous work instead of building an unbounded CPU queue. These are abuse
+controls for a portfolio demo, not user authentication; protect the Gemini
+project itself with provider-side quota and budget alerts as well.
+
+The Docker deployment hashes browser session tokens before storage and disables
+durable query logging. Exact/semantic caches still contain query text in the
+ephemeral container because they protect shared Gemini quota; they are scrubbed
+from every committed corpus build.
 
 ## Scope and limitations
 
@@ -207,8 +239,8 @@ Add `GEMINI_API_KEY` to `.env`. Advanced settings for model selection, uploads, 
 - Pre-generation refusals cover narrow company, fiscal-year, and named-segment checks. They do not prove that an arbitrary fact is absent from a filing, and vague questions can still be rejected by the ordinary reranking threshold.
 - Ingestion reads the PDF text layer with PyMuPDF. Scanned or image-only filings require OCR before Sage can use them.
 - Multi-turn generation receives conversation history, but retrieval runs against the latest question. Follow-ups should restate the financial metric instead of relying only on pronouns.
-- Upload ingestion is synchronous and disabled by default. The current Docker deployment directory contains a placeholder corpus; a deployer must ingest and package their own filings.
-- Generation requires Gemini. Embedding and reranking run locally, but their model weights must be downloaded before offline use.
+- Upload ingestion is synchronous and disabled by default. The public image is intentionally a fixed three-filing corpus.
+- Generation requires Gemini. Embedding and reranking run locally; Docker pins and downloads their model revisions at build time, while local development downloads them on first use.
 
 ## License
 

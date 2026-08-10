@@ -95,9 +95,11 @@ def test_embed_query_differs_from_embed_text_for_the_same_input(monkeypatch):
 
 def test_get_model_is_a_lazy_singleton(monkeypatch):
     load_count = {"n": 0}
+    received = {}
 
-    def fake_constructor(model_name):
+    def fake_constructor(model_name, *, revision):
         load_count["n"] += 1
+        received.update(model_name=model_name, revision=revision)
         return FakeSentenceTransformer(dimensions=4)
 
     monkeypatch.setattr(local_embedder, "_model", None)
@@ -107,6 +109,10 @@ def test_get_model_is_a_lazy_singleton(monkeypatch):
     local_embedder._get_model()
 
     assert load_count["n"] == 1
+    assert received == {
+        "model_name": "BAAI/bge-small-en-v1.5",
+        "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+    }
 
 
 # --- Real model integration test (see module docstring) ---

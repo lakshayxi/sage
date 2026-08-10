@@ -34,7 +34,10 @@ def _get_model() -> CrossEncoder:
         # locking so only the first one actually constructs it.
         with _model_lock:
             if _model is None:
-                _model = CrossEncoder(settings.RERANKER_MODEL)
+                _model = CrossEncoder(
+                    settings.RERANKER_MODEL,
+                    revision=settings.RERANKER_REVISION,
+                )
     return _model
 
 
