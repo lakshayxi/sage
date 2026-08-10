@@ -13,7 +13,7 @@
 #   2. runtime (python)      -- installs the Sage package, copies in the
 #      built frontend and the pre-ingested demo data, and runs uvicorn.
 
-FROM node:20-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS frontend-build
+FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS frontend-build
 WORKDIR /frontend
 # package-lock.json* (glob) tolerates the lockfile not existing yet while
 # frontend/ is still under active development elsewhere in this repo; once
