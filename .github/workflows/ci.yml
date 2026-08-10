@@ -48,7 +48,7 @@ jobs:
       # test that downloads BAAI/bge-small-en-v1.5 (~130MB) on first run --
       # cache it so subsequent CI runs don't re-download every time.
       - name: Cache sentence-transformers models
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/huggingface
           key: huggingface-models-${{ runner.os }}
