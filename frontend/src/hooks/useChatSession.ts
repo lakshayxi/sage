@@ -1,7 +1,7 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { createConversation, getConversation } from '../api/conversations'
 import { streamChat } from '../api/chat'
-import type { ChatResponse } from '../api/types'
+import type { ChatResponse, CitationOut } from '../api/types'
 
 export interface ChatTurn {
   id: string
@@ -9,10 +9,7 @@ export interface ChatTurn {
   status: 'streaming' | 'done' | 'error'
   answerText: string
   result: ChatResponse | null
-  // Turns loaded from a resumed conversation's history render with static
-  // (non-interactive) citation markers and never feed the right panel --
-  // only the numbering/citation set of the latest turn asked in *this*
-  // browser session is guaranteed to still be in scope. See CitationMarker.
+  citations: CitationOut[]
   fromHistory: boolean
   errorMessage: string | null
 }
@@ -33,34 +30,81 @@ export function useChatSession(onConversationCreated: () => void) {
   const [conversationId, setConversationId] = useState<number | null>(null)
   const [turns, setTurns] = useState<ChatTurn[]>([])
   const [isBusy, setIsBusy] = useState(false)
+  const activeRequest = useRef<{
+    controller: AbortController
+    turnId: string
+    resolve: () => void
+  } | null>(null)
+
+  const stopGenerating = useCallback(() => {
+    const request = activeRequest.current
+    if (!request) return
+
+    activeRequest.current = null
+    request.controller.abort()
+    setTurns((current) =>
+      current.map((turn) =>
+        turn.id === request.turnId ? { ...turn, status: 'done', result: null } : turn,
+      ),
+    )
+    setIsBusy(false)
+    request.resolve()
+  }, [])
+
+  useEffect(
+    () => () => {
+      // A route/app teardown should not leave the fetch or the Promise
+      // returned by ask() alive after this session hook is gone.
+      const request = activeRequest.current
+      if (!request) return
+      activeRequest.current = null
+      request.controller.abort()
+      request.resolve()
+    },
+    [],
+  )
 
   const startNewConversation = useCallback(() => {
+    stopGenerating()
     setConversationId(null)
     setTurns([])
-  }, [])
+  }, [stopGenerating])
 
-  const resumeConversation = useCallback(async (id: number) => {
-    const detail = await getConversation(id)
-    const loaded: ChatTurn[] = []
-    for (const message of detail.messages) {
-      if (message.role === 'user') {
-        loaded.push({
-          id: `history-${message.id}`,
-          query: message.content,
-          status: 'done',
-          answerText: '',
-          result: null,
-          fromHistory: true,
-          errorMessage: null,
-        })
-        continue
+  const resumeConversation = useCallback(
+    async (id: number) => {
+      stopGenerating()
+      const detail = await getConversation(id)
+      const loaded: ChatTurn[] = []
+      for (const message of detail.messages) {
+        if (message.role === 'user') {
+          loaded.push({
+            id: `history-${message.id}`,
+            query: message.content,
+            status: 'done',
+            answerText: '',
+            result: null,
+            citations: [],
+            fromHistory: true,
+            errorMessage: null,
+          })
+          continue
+        }
+        const last = loaded[loaded.length - 1]
+        if (last) {
+          last.answerText = message.content
+          last.citations = (message.citations ?? []).map((citation) => ({
+            ...citation,
+            text: citation.text ?? 'Excerpt unavailable for this older saved answer.',
+            fiscal_year: citation.fiscal_year ?? null,
+            doc_type: citation.doc_type ?? null,
+          }))
+        }
       }
-      const last = loaded[loaded.length - 1]
-      if (last) last.answerText = message.content
-    }
-    setConversationId(id)
-    setTurns(loaded)
-  }, [])
+      setConversationId(id)
+      setTurns(loaded)
+    },
+    [stopGenerating],
+  )
 
   const ask = useCallback(
     async (query: string, filters: QueryFilters) => {
@@ -80,6 +124,7 @@ export function useChatSession(onConversationCreated: () => void) {
           status: 'streaming',
           answerText: '',
           result: null,
+          citations: [],
           fromHistory: false,
           errorMessage: null,
         },
@@ -91,7 +136,14 @@ export function useChatSession(onConversationCreated: () => void) {
       }
 
       await new Promise<void>((resolve) => {
-        streamChat(
+        let settled = false
+        const settle = () => {
+          if (settled) return
+          settled = true
+          resolve()
+        }
+
+        const controller = streamChat(
           {
             query,
             companies: filters.companies,
@@ -101,30 +153,49 @@ export function useChatSession(onConversationCreated: () => void) {
           },
           {
             onDelta: (text) => {
+              if (controller.signal.aborted) return
               setTurns((current) =>
                 current.map((t) => (t.id === turnId ? { ...t, answerText: t.answerText + text } : t)),
               )
             },
             onDone: (result) => {
+              if (controller.signal.aborted) return
               // `result.answer` is the backend's authoritative full text --
               // prefer it over whatever partial text the accumulated deltas
               // produced, so a streaming edge case never leaves a
               // permanently-truncated answer on screen.
-              updateTurn({ status: 'done', result, answerText: result.answer })
+              updateTurn({
+                status: 'done',
+                result,
+                citations: result.citations,
+                answerText: result.answer,
+              })
+              if (activeRequest.current?.controller === controller) activeRequest.current = null
               setIsBusy(false)
-              resolve()
+              settle()
             },
             onError: (message) => {
+              if (controller.signal.aborted) return
               updateTurn({ status: 'error', errorMessage: message })
+              if (activeRequest.current?.controller === controller) activeRequest.current = null
               setIsBusy(false)
-              resolve()
+              settle()
             },
           },
         )
+        activeRequest.current = { controller, turnId, resolve: settle }
       })
     },
     [conversationId, onConversationCreated],
   )
 
-  return { conversationId, turns, isBusy, ask, startNewConversation, resumeConversation }
+  return {
+    conversationId,
+    turns,
+    isBusy,
+    ask,
+    stopGenerating,
+    startNewConversation,
+    resumeConversation,
+  }
 }

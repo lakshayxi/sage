@@ -28,7 +28,7 @@ describe('RightPanel', () => {
   it('shows citations and metadata without unfinished related-question copy', () => {
     const markup = renderToStaticMarkup(
       <CitationHighlightProvider>
-        <RightPanel result={result} />
+        <RightPanel result={result} citations={result.citations} />
       </CitationHighlightProvider>,
     )
 

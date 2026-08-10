@@ -1,9 +1,7 @@
 import type { ChatTurn } from '../hooks/useChatSession'
 import { AnswerMarkdown } from '../lib/renderAnswerText'
 
-export function AnswerTurn({ turn }: { turn: ChatTurn }) {
-  const interactive = !turn.fromHistory
-
+export function AnswerTurn({ turn, interactive }: { turn: ChatTurn; interactive: boolean }) {
   return (
     <article className="space-y-3">
       <p className="font-mono text-sm text-text-muted">

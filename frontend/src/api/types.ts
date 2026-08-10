@@ -36,15 +36,17 @@ export interface ChatResponse {
   session_id: number | null
 }
 
-// Citations as persisted on a historical message (sage/db/conversations.py
-// via api/routes/chat.py's _persist_turn) -- a smaller field set than
-// CitationOut, missing text/fiscal_year/doc_type.
 export interface StoredCitation {
   n: number
   chunk_id: number
   filename: string
   page_number: number | null
   company: string | null
+  // Optional for backward compatibility with conversations created before
+  // full citation snapshots were persisted.
+  text?: string
+  fiscal_year?: string | null
+  doc_type?: string | null
 }
 
 export interface ConversationSummaryOut {

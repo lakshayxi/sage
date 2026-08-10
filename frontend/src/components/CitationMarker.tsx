@@ -7,10 +7,9 @@ interface CitationMarkerProps {
 
 // The signature interaction: a compact gold-outlined mono numeral inline in
 // the answer text, bidirectionally linked to its citation card in the right
-// panel via CitationHighlightContext. Non-interactive markers (used for
-// past turns in a resumed conversation, where citation numbering restarts
-// each turn and the right panel only reflects the latest turn) render the
-// same look without the hookup.
+// panel via CitationHighlightContext. Only the newest visible answer is
+// interactive because citation numbering restarts per turn; older markers
+// keep the same visual treatment without targeting the newest card set.
 export function CitationMarker({ n, interactive }: CitationMarkerProps) {
   const { activeCitation, setActiveCitation, scrollToCard } = useCitationHighlight()
   const isActive = interactive && activeCitation === n

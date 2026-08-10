@@ -1,11 +1,15 @@
 import { useState } from 'react'
 import type { CitationOut } from '../api/types'
 import { useCitationHighlight } from '../context/CitationHighlightContext'
+import { formatFiscalYear } from '../lib/formatFiscalYear'
+import { getFilingSourceUrl } from '../lib/filingSources'
 
 export function CitationCard({ citation }: { citation: CitationOut }) {
   const { activeCitation, setActiveCitation, registerCard } = useCitationHighlight()
   const [expanded, setExpanded] = useState(false)
   const isActive = activeCitation === citation.n
+  const fiscalYear = formatFiscalYear(citation.fiscal_year)
+  const sourceUrl = getFilingSourceUrl(citation.filename)
 
   return (
     <div
@@ -31,16 +35,26 @@ export function CitationCard({ citation }: { citation: CitationOut }) {
           <span className="block truncate text-sm text-text">{citation.filename}</span>
           <span className="mt-0.5 flex flex-wrap gap-x-2 font-mono text-xs text-text-muted">
             {citation.company && <span>{citation.company}</span>}
-            {citation.fiscal_year && <span>FY{citation.fiscal_year}</span>}
+            {fiscalYear && <span>{fiscalYear}</span>}
             {citation.page_number != null && <span>p.{citation.page_number}</span>}
           </span>
         </span>
         <span className="mt-0.5 shrink-0 font-mono text-xs text-text-muted">{expanded ? '▾' : '▸'}</span>
       </button>
       {expanded && (
-        <p className="mt-2 border-t border-border pt-2 text-sm leading-relaxed text-text-muted">
-          {citation.text}
-        </p>
+        <div className="mt-2 border-t border-border pt-2">
+          <p className="text-sm leading-relaxed text-text-muted">{citation.text}</p>
+          {sourceUrl && (
+            <a
+              href={sourceUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="mt-2 inline-block font-mono text-xs text-accent underline-offset-4 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent"
+            >
+              Open SEC filing ↗
+            </a>
+          )}
+        </div>
       )}
     </div>
   )

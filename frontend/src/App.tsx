@@ -32,20 +32,27 @@ function App() {
     refreshConversations()
   }, [refreshConversations])
 
-  const { conversationId, turns, isBusy, ask, startNewConversation, resumeConversation } =
-    useChatSession(refreshConversations)
+  const {
+    conversationId,
+    turns,
+    isBusy,
+    ask,
+    stopGenerating,
+    startNewConversation,
+    resumeConversation,
+  } = useChatSession(refreshConversations)
 
   const companies = useMemo(
     () => Array.from(new Set(documents.map((d) => d.company).filter((c): c is string => Boolean(c)))).sort(),
     [documents],
   )
 
-  const latestResult = useMemo(() => {
+  const latestAnswer = useMemo(() => {
     for (let i = turns.length - 1; i >= 0; i -= 1) {
       const turn = turns[i]
-      if (!turn.fromHistory && turn.result) return turn.result
+      if (turn.answerText) return { result: turn.result, citations: turn.citations }
     }
-    return null
+    return { result: null, citations: [] }
   }, [turns])
 
   function toggleCompany(company: string) {
@@ -130,7 +137,12 @@ function App() {
           )}
 
           <main className="min-h-0 min-w-0 flex-1">
-            <MainPanel turns={turns} onAsk={handleAsk} isBusy={isBusy} />
+            <MainPanel
+              turns={turns}
+              onAsk={handleAsk}
+              onStop={stopGenerating}
+              isBusy={isBusy}
+            />
           </main>
 
           <aside
@@ -138,7 +150,7 @@ function App() {
               citationsOpen ? 'translate-x-0' : 'translate-x-full'
             }`}
           >
-            <RightPanel result={latestResult} />
+            <RightPanel result={latestAnswer.result} citations={latestAnswer.citations} />
           </aside>
           {citationsOpen && (
             <button
