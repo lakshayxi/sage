@@ -1,11 +1,9 @@
-"""Shared demo-access-key gate for the public deployment.
+"""ASGI-level public input guards for access, body size, and header size.
 
-When `settings.DEMO_ACCESS_KEY` is unset (the local-dev default), this is a
-complete no-op -- the request is passed straight through with no header
-check. When set, every request under /chat, /conversations, or /documents
-must carry a matching key via the `X-Demo-Key` header or get a 401. Static
-assets (once a frontend is served from this same app) are intentionally not
-covered by the prefixes below.
+When `settings.DEMO_ACCESS_KEY` is unset (the local-dev default), its gate is
+a complete no-op. When set, every request under /chat, /conversations, or
+/documents must carry a matching key via the `X-Demo-Key` header or get a
+401. Static assets are intentionally not covered by the protected prefixes.
 
 IMPORTANT -- this is a shared casual-access deterrent, not a real secret or
 an authentication boundary: `VITE_DEMO_ACCESS_KEY` (the frontend's copy of
@@ -50,11 +48,70 @@ class DemoKeyMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-class _UploadTooLarge(Exception):
+class _BodyTooLarge(Exception):
     pass
 
 
-class MaxUploadBodySizeMiddleware:
+class _MaxBodySizeMiddleware:
+    """Shared streaming body guard used by the API and upload limits."""
+
+    app: ASGIApp
+
+    def _applies(self, scope: Scope) -> bool:
+        raise NotImplementedError
+
+    def _max_bytes(self) -> int:
+        raise NotImplementedError
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not self._applies(scope):
+            await self.app(scope, receive, send)
+            return
+
+        max_bytes = self._max_bytes()
+        content_length = _parse_content_length(scope.get("headers", []))
+        if content_length is not None and content_length > max_bytes:
+            await _reject_413(send, max_bytes)
+            return
+
+        total = 0
+
+        async def guarded_receive() -> Message:
+            nonlocal total
+            message = await receive()
+            if message["type"] == "http.request":
+                total += len(message.get("body", b""))
+                if total > max_bytes:
+                    raise _BodyTooLarge()
+            return message
+
+        try:
+            await self.app(scope, guarded_receive, send)
+        except _BodyTooLarge:
+            await _reject_413(send, max_bytes)
+
+
+class MaxRequestBodySizeMiddleware(_MaxBodySizeMiddleware):
+    """Bound ordinary request bodies before FastAPI buffers and validates them.
+
+    Upload paths are explicitly excluded because multipart requests have a
+    practical, larger limit enforced by `MaxUploadBodySizeMiddleware`. The
+    setting is read for each request so tests and runtime configuration behave
+    consistently with the upload guard.
+    """
+
+    def __init__(self, app: ASGIApp, excluded_path_prefixes: tuple[str, ...] = ()) -> None:
+        self.app = app
+        self.excluded_path_prefixes = excluded_path_prefixes
+
+    def _applies(self, scope: Scope) -> bool:
+        return not scope["path"].startswith(self.excluded_path_prefixes)
+
+    def _max_bytes(self) -> int:
+        return settings.MAX_REQUEST_BODY_BYTES
+
+
+class MaxUploadBodySizeMiddleware(_MaxBodySizeMiddleware):
     """Rejects a request body over `settings.MAX_UPLOAD_BYTES` for paths
     under `path_prefix`, enforced as bytes actually arrive from the client.
 
@@ -95,33 +152,51 @@ class MaxUploadBodySizeMiddleware:
         self.app = app
         self.path_prefix = path_prefix
 
+    def _applies(self, scope: Scope) -> bool:
+        return scope["path"].startswith(self.path_prefix)
+
+    def _max_bytes(self) -> int:
+        return settings.MAX_UPLOAD_BYTES
+
+
+class SessionTokenLengthMiddleware:
+    """Reject an oversized session token before it reaches a database lookup."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not scope["path"].startswith(self.path_prefix):
-            await self.app(scope, receive, send)
+        if scope["type"] == "http" and any(
+            name.lower() == b"x-session-token" and len(value) > settings.MAX_SESSION_TOKEN_LENGTH
+            for name, value in scope.get("headers", [])
+        ):
+            await _reject_json(send, 400, "Invalid request header")
             return
+        await self.app(scope, receive, send)
 
-        max_bytes = settings.MAX_UPLOAD_BYTES
 
-        content_length = _parse_content_length(scope.get("headers", []))
-        if content_length is not None and content_length > max_bytes:
-            await _reject_413(send, max_bytes)
-            return
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Apply browser hardening to API errors and the single-page frontend."""
 
-        total = 0
-
-        async def guarded_receive() -> Message:
-            nonlocal total
-            message = await receive()
-            if message["type"] == "http.request":
-                total += len(message.get("body", b""))
-                if total > max_bytes:
-                    raise _UploadTooLarge()
-            return message
-
-        try:
-            await self.app(scope, guarded_receive, send)
-        except _UploadTooLarge:
-            await _reject_413(send, max_bytes)
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+        response.headers.setdefault(
+            "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"
+        )
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com data:; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "base-uri 'self'; object-src 'none'; form-action 'self'; "
+            "frame-ancestors 'self' https://huggingface.co https://*.hf.space",
+        )
+        return response
 
 
 def _parse_content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
@@ -135,11 +210,15 @@ def _parse_content_length(headers: list[tuple[bytes, bytes]]) -> int | None:
 
 
 async def _reject_413(send: Send, max_bytes: int) -> None:
-    body = json.dumps({"detail": f"Request body exceeds the maximum of {max_bytes} bytes"}).encode()
+    await _reject_json(send, 413, f"Request body exceeds the maximum of {max_bytes} bytes")
+
+
+async def _reject_json(send: Send, status_code: int, detail: str) -> None:
+    body = json.dumps({"detail": detail}).encode()
     await send(
         {
             "type": "http.response.start",
-            "status": 413,
+            "status": status_code,
             "headers": [(b"content-type", b"application/json")],
         }
     )

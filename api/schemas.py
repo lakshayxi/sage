@@ -73,7 +73,7 @@ class ChatResponse(BaseModel):
 
 
 class ConversationCreateRequest(BaseModel):
-    title: str | None = None
+    title: str | None = Field(default=None, max_length=settings.MAX_CONVERSATION_TITLE_LENGTH)
 
 
 class ConversationCreateResponse(BaseModel):

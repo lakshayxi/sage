@@ -50,12 +50,11 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # same key -- a Google-side capacity issue, not a quota/auth problem (ruled
 # out by testing gemini-2.0-flash on the same key in the same breath, which
 # correctly came back 429 quota-exhausted instead, a different error).
-# "gemini-flash-lite-latest" (Google's rolling alias for its lite Flash tier)
-# was live-verified working on the same key at the same time, so it's the
-# default until flash-latest's availability is confirmed stable again -- at
-# the cost of the concrete model (and therefore its exact price) potentially
-# changing without a code change on Google's side.
-GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-flash-lite-latest")
+# Pin the production default to a concrete stable model rather than a rolling
+# alias. A rolling alias can silently change answer quality and price between
+# two deployments built from the same commit, which makes the telemetry in a
+# portfolio demo impossible to reproduce.
+GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite")
 
 # --- Embeddings (local, not Gemini -- see sage/embed/local_embedder.py) ---
 # BAAI/bge-small-en-v1.5, 384-d: same vendor as RERANKER_MODEL below, small
@@ -65,6 +64,9 @@ GEMINI_CHAT_MODEL = os.environ.get("GEMINI_CHAT_MODEL", "gemini-flash-lite-lates
 # collection built under a different embedding model must be rebuilt
 # (delete data/chroma/ and re-ingest), not reused.
 LOCAL_EMBEDDING_MODEL = os.environ.get("SAGE_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+LOCAL_EMBEDDING_REVISION = os.environ.get(
+    "SAGE_EMBEDDING_REVISION", "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
+)
 
 # --- Chunking ---
 CHUNK_TOKENS = 650  # target chunk size (word-count approximation), ~500-800 window
@@ -77,7 +79,10 @@ DEFAULT_TOP_K = 5
 # In multi-company mode this is the per-company candidate count, not a global
 # total -- see sage/retrieval/retriever.py.
 RERANK_CANDIDATE_K = 30
-RERANKER_MODEL = "BAAI/bge-reranker-base"
+RERANKER_MODEL = os.environ.get("SAGE_RERANKER_MODEL", "BAAI/bge-reranker-base")
+RERANKER_REVISION = os.environ.get(
+    "SAGE_RERANKER_REVISION", "2cfc18c9415c912f9d8155881c133215df768a70"
+)
 # Public comparison scope is intentionally bounded before the per-company
 # retrieval loop: total work/context otherwise scales as companies × the
 # candidate/selection budgets.
@@ -112,17 +117,15 @@ SEMANTIC_CACHE_THRESHOLD = 0.05
 CACHE_TTL_SECONDS = 6 * 60 * 60
 
 # --- Cost estimation ---
-# $/1K-token rates, used to compute QueryLog.cost_usd. Checked via WebFetch
-# against ai.google.dev/gemini-api/docs/pricing on 2026-07-17 (paid-tier
+# $/1K-token rates, used to compute QueryLog.cost_usd. Checked against the
+# official Gemini pricing page on 2026-08-11 (paid-tier
 # rates; actual billing stays $0 while under the free-tier quota). Update
 # here if GEMINI_CHAT_MODEL is swapped to a model not listed below -- an
 # unlisted model falls back to a 0.0 rate rather than raising (see
 # sage/generation/cost.py). gemini-2.5-flash/-lite are kept here for
 # reference even though live-testing found them 404 for new users (see
 # GEMINI_CHAT_MODEL's comment) -- an existing account with prior access might
-# still be routed to them. "gemini-flash-latest" (the default) has no fixed
-# rate here since it's a rolling alias -- its cost estimate falls back to
-# 0.0 until it's pinned to a concrete model id. No entry for
+# still be routed to them. No entry for
 # LOCAL_EMBEDDING_MODEL: local embeddings run on this machine's own
 # CPU/GPU, so their cost is genuinely and always $0, not merely
 # falling back to the same default an unlisted cloud model would.
@@ -130,6 +133,7 @@ MODEL_COST_PER_1K_TOKENS: dict[str, dict[str, float]] = {
     "gemini-2.5-flash": {"prompt": 0.0003, "completion": 0.0025},
     "gemini-2.5-flash-lite": {"prompt": 0.0001, "completion": 0.0004},
     "gemini-3.5-flash": {"prompt": 0.0015, "completion": 0.009},
+    "gemini-3.5-flash-lite": {"prompt": 0.0003, "completion": 0.0025},
 }
 
 for _dir in (RAW_DIR, PROCESSED_DIR, CHROMA_DIR, DB_DIR):
@@ -154,6 +158,12 @@ ALLOW_UPLOADS = os.environ.get("ALLOW_UPLOADS", "false").lower() == "true"
 # a real multi-hundred-page 10-K (the demo corpus's largest filing is well
 # under this) while still bounding worst-case disk/memory use per upload.
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+# FastAPI reads JSON request bodies in full before Pydantic validates their
+# fields, so field-level limits alone do not bound the memory spent on an
+# attacker-controlled body. Keep ordinary API requests small at the ASGI
+# boundary; multipart uploads are excluded from this limit and retain their
+# separate, larger MAX_UPLOAD_BYTES ceiling above.
+MAX_REQUEST_BODY_BYTES = int(os.environ.get("MAX_REQUEST_BODY_BYTES", str(64 * 1024)))
 # Hard ceiling on a single upload's page count, checked after the file is
 # confirmed to be a readable PDF but before it's handed to the (synchronous,
 # in-request) ingest pipeline -- keeps a single upload's ingestion latency
@@ -164,7 +174,29 @@ MAX_UPLOAD_PAGES = int(os.environ.get("MAX_UPLOAD_PAGES", "500"))
 # Gemini prompt, where it would otherwise burn real compute/quota on
 # obvious junk input.
 MAX_QUERY_LENGTH = int(os.environ.get("MAX_QUERY_LENGTH", "2000"))
+# Conversation titles are persisted and returned in sidebar responses; the
+# session token is used as an indexed database lookup key. Both are public
+# inputs, so bound them before they can create oversized rows or queries.
+MAX_CONVERSATION_TITLE_LENGTH = int(os.environ.get("MAX_CONVERSATION_TITLE_LENGTH", "200"))
+MAX_SESSION_TOKEN_LENGTH = int(os.environ.get("MAX_SESSION_TOKEN_LENGTH", "128"))
 # slowapi rate-limit spec string, applied to POST /chat, POST /chat/stream,
 # and POST /documents/upload to protect the free Gemini quota (and, for
 # uploads, ingestion capacity) behind the public deployment.
 CHAT_RATE_LIMIT = os.environ.get("CHAT_RATE_LIMIT", "10/minute")
+# Conversation creation is cheap compared with generation but still writes a
+# durable database row. Give it its own limit so repeated creates cannot grow
+# storage without consuming the chat quota.
+CONVERSATION_RATE_LIMIT = os.environ.get("CONVERSATION_RATE_LIMIT", "10/minute")
+# Anonymous public sessions need storage retention as well as request-rate
+# limits: a legitimate visitor can create and resume several threads, while
+# abandoned history cannot grow the deployment database without bound.
+MAX_CONVERSATIONS_PER_SESSION = int(os.environ.get("MAX_CONVERSATIONS_PER_SESSION", "25"))
+MAX_TOTAL_CONVERSATIONS = int(os.environ.get("MAX_TOTAL_CONVERSATIONS", "500"))
+MAX_MESSAGES_PER_CONVERSATION = int(os.environ.get("MAX_MESSAGES_PER_CONVERSATION", "50"))
+MAX_CONCURRENT_GENERATIONS = int(os.environ.get("MAX_CONCURRENT_GENERATIONS", "2"))
+QUERY_LOGGING_ENABLED = os.environ.get("QUERY_LOGGING_ENABLED", "true").lower() == "true"
+# Same-origin is the deployment default. Set a comma-separated allow-list only
+# when a separately hosted frontend genuinely needs browser CORS access.
+CORS_ORIGINS = [
+    origin.strip() for origin in os.environ.get("CORS_ORIGINS", "").split(",") if origin.strip()
+]

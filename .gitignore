@@ -1,4 +1,6 @@
-.venv/
+.venv*/
+.DS_Store
+backups/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -16,5 +18,7 @@ data/chroma/*
 # blanket `*.db` ignore above so it actually gets committed.
 !deploy/huggingface/prebuilt/sage.db
 .env
+.env.*
+!.env.example
 *.egg-info/
 eval/results/

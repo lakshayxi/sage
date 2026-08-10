@@ -10,7 +10,7 @@ understated Content-Length" defense works, only the fast-path header check.
 
 import pytest
 
-from api.middleware import MaxUploadBodySizeMiddleware
+from api.middleware import MaxRequestBodySizeMiddleware, MaxUploadBodySizeMiddleware
 from config import settings
 
 
@@ -40,8 +40,8 @@ def _make_receiver(chunks: list[tuple[bytes, bool]]):
     return receive
 
 
-async def _run(middleware, headers, chunks):
-    scope = {"type": "http", "path": "/documents/upload", "headers": headers}
+async def _run(middleware, headers, chunks, path="/documents/upload"):
+    scope = {"type": "http", "path": path, "headers": headers}
     receive = _make_receiver(chunks)
     responses = []
 
@@ -164,3 +164,56 @@ async def test_reads_max_upload_bytes_live_not_frozen_at_construction(monkeypatc
     )
 
     assert status == 413
+
+
+@pytest.mark.anyio
+async def test_api_body_limit_counts_bytes_without_content_length(monkeypatch):
+    monkeypatch.setattr(settings, "MAX_REQUEST_BODY_BYTES", 1000)
+    middleware = MaxRequestBodySizeMiddleware(
+        _draining_app, excluded_path_prefixes=("/documents/upload",)
+    )
+
+    status, _body = await _run(
+        middleware,
+        headers=[(b"content-type", b"application/json")],
+        chunks=[(b"x" * 600, True), (b"y" * 600, False)],
+        path="/chat",
+    )
+
+    assert status == 413
+
+
+@pytest.mark.anyio
+async def test_api_body_limit_allows_body_at_exact_limit(monkeypatch):
+    monkeypatch.setattr(settings, "MAX_REQUEST_BODY_BYTES", 1000)
+    middleware = MaxRequestBodySizeMiddleware(
+        _draining_app, excluded_path_prefixes=("/documents/upload",)
+    )
+
+    status, body = await _run(
+        middleware,
+        headers=[(b"content-length", b"1000")],
+        chunks=[(b"x" * 1000, False)],
+        path="/chat",
+    )
+
+    assert status == 200
+    assert body == b"1000"
+
+
+@pytest.mark.anyio
+async def test_api_body_limit_defers_uploads_to_the_stricter_upload_limit(monkeypatch):
+    monkeypatch.setattr(settings, "MAX_REQUEST_BODY_BYTES", 10)
+    middleware = MaxRequestBodySizeMiddleware(
+        _draining_app, excluded_path_prefixes=("/documents/upload",)
+    )
+
+    status, body = await _run(
+        middleware,
+        headers=[(b"content-length", b"100")],
+        chunks=[(b"x" * 100, False)],
+        path="/documents/upload",
+    )
+
+    assert status == 200
+    assert body == b"100"

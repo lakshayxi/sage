@@ -6,6 +6,7 @@ from fpdf import FPDF
 
 import api.routes.chat as chat_routes
 import api.routes.documents as documents_routes
+from api.capacity import reset_generation_capacity
 from api.limiter import limiter
 from api.main import app
 from config import settings
@@ -19,7 +20,9 @@ def _reset_limiter():
     # rate-limit test earlier in the run would otherwise bleed into later
     # tests hitting the same /chat* routes.
     limiter.reset()
+    reset_generation_capacity()
     yield
+    reset_generation_capacity()
 
 
 @pytest.fixture
@@ -263,6 +266,53 @@ def test_chat_rate_limit_returns_429_past_threshold(monkeypatch, client):
     assert responses[10].status_code == 429
 
 
+def test_stream_and_nonstream_chat_share_one_rate_limit(monkeypatch, client):
+    monkeypatch.setattr(chat_routes, "generate_answer", lambda *a, **kw: _fake_answer())
+
+    def fake_stream(*args, **kwargs):
+        yield _fake_answer()
+
+    monkeypatch.setattr(chat_routes, "generate_answer_stream", fake_stream)
+    assert [client.post("/chat", json={"query": "q"}).status_code for _ in range(9)] == [200] * 9
+    with client.stream("POST", "/chat/stream", json={"query": "q"}) as response:
+        assert response.status_code == 200
+        list(response.iter_text())
+    assert client.post("/chat", json={"query": "q"}).status_code == 429
+
+
+def test_chat_rejects_work_when_generation_capacity_is_full(monkeypatch, client):
+    monkeypatch.setattr(chat_routes, "try_acquire_generation_slot", lambda: False)
+    response = client.post("/chat", json={"query": "q"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "The demo is busy; please retry shortly"
+
+
+def test_oversized_json_body_is_rejected_before_validation(monkeypatch, client):
+    """Unknown JSON fields are normally ignored by Pydantic, so a caller
+    must not be able to use one to make FastAPI buffer an arbitrarily large
+    request before route-level field validation runs."""
+    monkeypatch.setattr(settings, "MAX_REQUEST_BODY_BYTES", 64)
+
+    response = client.post(
+        "/conversations",
+        content=b'{"title":null,"padding":"' + b"x" * 100 + b'"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+
+
+def test_json_body_at_limit_remains_accepted(monkeypatch, client):
+    body = b'{"title":"within limit"}'
+    monkeypatch.setattr(settings, "MAX_REQUEST_BODY_BYTES", len(body))
+
+    response = client.post(
+        "/conversations", content=body, headers={"Content-Type": "application/json"}
+    )
+
+    assert response.status_code == 200
+
+
 # --- /conversations ---
 
 
@@ -289,6 +339,53 @@ def test_conversation_create_list_get_round_trip(client):
     body = detail_response.json()
     assert body["id"] == conversation_id
     assert [m["content"] for m in body["messages"]] == ["What were margins?", "They declined."]
+
+
+def test_conversation_title_length_is_bounded(client):
+    accepted = client.post(
+        "/conversations", json={"title": "t" * settings.MAX_CONVERSATION_TITLE_LENGTH}
+    )
+    rejected = client.post(
+        "/conversations", json={"title": "t" * (settings.MAX_CONVERSATION_TITLE_LENGTH + 1)}
+    )
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == 422
+
+
+def test_session_token_header_length_is_bounded(client):
+    accepted = client.get(
+        "/conversations", headers={"X-Session-Token": "t" * settings.MAX_SESSION_TOKEN_LENGTH}
+    )
+    rejected = client.get(
+        "/conversations",
+        headers={"X-Session-Token": "t" * (settings.MAX_SESSION_TOKEN_LENGTH + 1)},
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json() == []
+    assert rejected.status_code == 400
+    assert rejected.json() == {"detail": "Invalid request header"}
+
+
+def test_session_token_header_limit_also_protects_chat(client):
+    response = client.post(
+        "/chat",
+        json={"query": "q"},
+        headers={"X-Session-Token": "t" * (settings.MAX_SESSION_TOKEN_LENGTH + 1)},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid request header"}
+
+
+def test_conversation_create_rate_limit_returns_429_past_threshold(client):
+    responses = [client.post("/conversations", json={}) for _ in range(11)]
+
+    assert [response.status_code for response in responses[:10]] == [200] * 10
+    assert responses[10].status_code == 429
+    # Read-only history access remains available after the write limit is hit.
+    assert client.get("/conversations").status_code == 200
 
 
 def test_second_conversation_reuses_the_same_session_token(client):
@@ -664,6 +761,46 @@ def test_startup_does_not_warn_when_documents_exist(monkeypatch, caplog):
             pass
 
     assert not any("no documents are ingested" in record.message for record in caplog.records)
+
+
+def test_healthz_is_live_even_without_a_corpus(client):
+    response = client.get("/healthz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_readyz_rejects_an_empty_corpus(client):
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json() == {"status": "not_ready", "documents": 0}
+
+
+def test_readyz_accepts_a_ready_document(client):
+    from sage.db.database import get_session
+    from sage.db.models import Document
+
+    session = get_session()
+    session.add(
+        Document(
+            filename="Apple_FY25_filing.pdf",
+            source_path="Apple_FY25_filing.pdf",
+            page_count=1,
+            status="ready",
+        )
+    )
+    session.commit()
+    session.close()
+
+    response = client.get("/readyz")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ready", "documents": 1}
+
+
+def test_browser_security_headers_are_applied(client):
+    response = client.get("/healthz")
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+    assert "default-src 'self'" in response.headers["content-security-policy"]
 
 
 # --- routing: wrong-method requests should 405, not fall through to the

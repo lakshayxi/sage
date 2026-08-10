@@ -9,8 +9,9 @@ A missing/wrong token gets an empty list (GET /conversations) or a 404
 (GET /conversations/{id}, never a 403, so it doesn't confirm the id exists).
 """
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 
+from api.limiter import limiter
 from api.schemas import (
     ConversationCreateRequest,
     ConversationCreateResponse,
@@ -18,13 +19,16 @@ from api.schemas import (
     ConversationSummaryOut,
     MessageOut,
 )
+from config import settings
 from sage.db.conversations import create_conversation, get_conversation, list_conversations
 
 router = APIRouter()
 
 
 @router.post("/conversations", response_model=ConversationCreateResponse)
+@limiter.limit(settings.CONVERSATION_RATE_LIMIT)
 def create(
+    request: Request,
     body: ConversationCreateRequest,
     x_session_token: str = Header(default="", alias="X-Session-Token"),
 ) -> ConversationCreateResponse:

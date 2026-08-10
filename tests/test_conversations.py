@@ -20,7 +20,8 @@ def test_create_conversation_reuses_a_given_session_token():
     )
     assert token == "existing-token"
     row = conversations.get_conversation(conversation_id)
-    assert row.session_token == "existing-token"
+    assert row.session_token != "existing-token"
+    assert len(row.session_token) == 64
 
 
 def test_append_message_auto_increments_ordered():
@@ -96,3 +97,45 @@ def test_conversation_belongs_to_session():
     assert conversations.conversation_belongs_to_session(conversation_id, token) is True
     assert conversations.conversation_belongs_to_session(conversation_id, "wrong-token") is False
     assert conversations.conversation_belongs_to_session(999999, token) is False
+
+
+def test_create_conversation_prunes_oldest_for_same_session(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "MAX_CONVERSATIONS_PER_SESSION", 2)
+    first, _ = conversations.create_conversation(title="first", session_token="visitor")
+    second, _ = conversations.create_conversation(title="second", session_token="visitor")
+    third, _ = conversations.create_conversation(title="third", session_token="visitor")
+
+    assert conversations.get_conversation(first) is None
+    assert [row.id for row in conversations.list_conversations("visitor")] == [third, second]
+
+
+def test_create_conversation_prunes_global_oldest(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "MAX_TOTAL_CONVERSATIONS", 2)
+    first, _ = conversations.create_conversation(title="first")
+    second, _ = conversations.create_conversation(title="second")
+    third, _ = conversations.create_conversation(title="third")
+
+    assert conversations.get_conversation(first) is None
+    assert {row.id for row in conversations.list_conversations()} == {second, third}
+
+
+def test_assistant_append_prunes_oldest_complete_turns(monkeypatch):
+    from config import settings
+
+    monkeypatch.setattr(settings, "MAX_MESSAGES_PER_CONVERSATION", 4)
+    conversation_id, _ = conversations.create_conversation(title="bounded")
+    for turn in range(3):
+        conversations.append_message(conversation_id, "user", f"question {turn}")
+        conversations.append_message(conversation_id, "assistant", f"answer {turn}")
+
+    history = conversations.get_history(conversation_id)
+    assert [(row.role, row.content) for row in history] == [
+        ("user", "question 1"),
+        ("assistant", "answer 1"),
+        ("user", "question 2"),
+        ("assistant", "answer 2"),
+    ]

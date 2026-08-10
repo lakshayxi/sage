@@ -122,10 +122,10 @@ class Conversation(Base):
 
     id = Column(Integer, primary_key=True)
     title = Column(String, nullable=True)
-    # Opaque, unguessable per-session identifier (secrets.token_urlsafe(32),
-    # see sage/db/conversations.py:create_conversation) -- the only thing
-    # that scopes a conversation to the visitor who created it. Every
-    # conversation has one; there is no user-account concept.
+    # SHA-256 digest of the opaque, unguessable browser token minted by
+    # create_conversation. The raw bearer token is returned once and remains
+    # in the browser, so a database snapshot cannot be used to resume a
+    # visitor's conversations. There is no user-account concept.
     session_token = Column(String, nullable=False, index=True)
     created_at = Column(DateTime, default=_utcnow)
 

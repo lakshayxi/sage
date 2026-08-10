@@ -7,6 +7,7 @@ for cache writes).
 
 from typing import TYPE_CHECKING
 
+from config import settings
 from sage.db.database import get_session
 from sage.db.models import QueryLog
 
@@ -31,6 +32,8 @@ def record_query_log(
     `total_latency_ms` is used only when `result` is None (a failed query),
     to record whatever elapsed time was captured before the failure.
     """
+    if not settings.QUERY_LOGGING_ENABLED:
+        return 0
     session = get_session()
     try:
         log = QueryLog(

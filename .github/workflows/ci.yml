@@ -36,6 +36,14 @@ jobs:
       - name: Ruff format check
         run: ruff format --check .
 
+      - name: Dependency advisory audit
+        run: |
+          pip install pip-audit==2.10.1
+          # Chroma's advisory is for its optional unauthenticated HTTP server
+          # collection-creation API. Sage instantiates PersistentClient
+          # in-process and exposes no Chroma server or Chroma API route.
+          pip-audit -r requirements-lock.txt --ignore-vuln PYSEC-2026-311
+
       # tests/test_local_embedder.py includes one real-model integration
       # test that downloads BAAI/bge-small-en-v1.5 (~130MB) on first run --
       # cache it so subsequent CI runs don't re-download every time.

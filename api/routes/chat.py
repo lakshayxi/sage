@@ -1,10 +1,12 @@
 """POST /chat (non-streaming), POST /chat/stream (SSE-style, fetch-driven)."""
 
 import json
+import logging
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
+from api.capacity import release_generation_slot, try_acquire_generation_slot
 from api.limiter import limiter
 from api.schemas import ChatRequest, ChatResponse, CitationOut, LatencyOut, TokensOut
 from config import settings
@@ -12,6 +14,7 @@ from sage.db.conversations import append_message, conversation_belongs_to_sessio
 from sage.generation.answer_engine import AnswerResult, generate_answer, generate_answer_stream
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # The model is instructed to end its response with a ```citations fenced
 # block, but doesn't always include the backtick fence (see
@@ -54,6 +57,9 @@ def _persist_turn(conversation_id: int, query: str, result: AnswerResult) -> Non
                 "filename": c.filename,
                 "page_number": c.page_number,
                 "company": c.company,
+                "text": c.text,
+                "fiscal_year": c.fiscal_year,
+                "doc_type": c.doc_type,
             }
             for c in result.citations
         ],
@@ -61,7 +67,7 @@ def _persist_turn(conversation_id: int, query: str, result: AnswerResult) -> Non
 
 
 @router.post("/chat", response_model=ChatResponse)
-@limiter.limit(settings.CHAT_RATE_LIMIT)
+@limiter.shared_limit(settings.CHAT_RATE_LIMIT, scope="chat-generation")
 def chat(
     request: Request,
     body: ChatRequest,
@@ -73,6 +79,8 @@ def chat(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     history = get_history(body.session_id) if body.session_id is not None else None
+    if not try_acquire_generation_slot():
+        raise HTTPException(status_code=503, detail="The demo is busy; please retry shortly")
     try:
         result = generate_answer(
             body.query,
@@ -84,7 +92,10 @@ def chat(
             session_id=str(body.session_id) if body.session_id is not None else None,
         )
     except Exception:
+        logger.exception("Chat generation failed")
         raise HTTPException(status_code=500, detail="Failed to generate an answer") from None
+    finally:
+        release_generation_slot()
 
     if body.session_id is not None:
         _persist_turn(body.session_id, body.query, result)
@@ -92,11 +103,12 @@ def chat(
     try:
         return _to_chat_response(result, body.session_id)
     except Exception:
+        logger.exception("Chat response serialization failed")
         raise HTTPException(status_code=500, detail="Failed to generate an answer") from None
 
 
 @router.post("/chat/stream")
-@limiter.limit(settings.CHAT_RATE_LIMIT)
+@limiter.shared_limit(settings.CHAT_RATE_LIMIT, scope="chat-generation")
 def chat_stream(
     request: Request,
     body: ChatRequest,
@@ -117,6 +129,8 @@ def chat_stream(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     history = get_history(body.session_id) if body.session_id is not None else None
+    if not try_acquire_generation_slot():
+        raise HTTPException(status_code=503, detail="The demo is busy; please retry shortly")
 
     def event_source():
         # See FENCE_MARKERS: a delta chunk could contain only part of a
@@ -160,6 +174,7 @@ def chat_stream(
                 else:
                     result = item
         except Exception:
+            logger.exception("Streaming chat generation failed")
             error_payload = {"detail": "Failed to generate an answer"}
             yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
             return
@@ -186,9 +201,16 @@ def chat_stream(
         try:
             payload = _to_chat_response(result, body.session_id).model_dump()
         except Exception:
+            logger.exception("Streaming chat response serialization failed")
             error_payload = {"detail": "Failed to generate an answer"}
             yield f"event: error\ndata: {json.dumps(error_payload)}\n\n"
             return
         yield f"event: done\ndata: {json.dumps(payload)}\n\n"
 
-    return StreamingResponse(event_source(), media_type="text/event-stream")
+    def guarded_event_source():
+        try:
+            yield from event_source()
+        finally:
+            release_generation_slot()
+
+    return StreamingResponse(guarded_event_source(), media_type="text/event-stream")

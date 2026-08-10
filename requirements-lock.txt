@@ -15,7 +15,7 @@
 # by actually installing from the lock file in a real 3.11 venv, not just
 # reasoning about it.
 aiohappyeyeballs==2.7.1
-aiohttp==3.14.1
+aiohttp==3.14.3
 aiosignal==1.4.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
@@ -28,7 +28,7 @@ cffi==2.1.0
 charset-normalizer==3.4.9
 chromadb==1.5.9
 click==8.4.2
-cryptography==49.0.0
+cryptography==50.0.0
 defusedxml==0.7.1
 Deprecated==1.3.1
 distro==1.9.0

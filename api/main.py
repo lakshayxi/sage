@@ -4,14 +4,21 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from api.limiter import limiter
-from api.middleware import DemoKeyMiddleware, MaxUploadBodySizeMiddleware
+from api.middleware import (
+    DemoKeyMiddleware,
+    MaxRequestBodySizeMiddleware,
+    MaxUploadBodySizeMiddleware,
+    SecurityHeadersMiddleware,
+    SessionTokenLengthMiddleware,
+)
 from api.routes import chat, conversations, documents
+from config import settings
 from sage.db.database import get_session, init_db
 from sage.db.models import Document
 from sage.embed.local_embedder import _get_model as _get_embedding_model
@@ -60,6 +67,7 @@ def _warn_if_corpus_empty() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.ready = False
     init_db()
     _warn_if_corpus_empty()
     # Load both lazy-singleton models once at startup, off the request path
@@ -68,7 +76,11 @@ async def lifespan(app: FastAPI):
     # latency lands on whichever user happens to ask first.
     _get_embedding_model()
     _get_reranker_model()
-    yield
+    app.state.ready = True
+    try:
+        yield
+    finally:
+        app.state.ready = False
 
 
 app = FastAPI(title="Sage API", lifespan=lifespan)
@@ -77,29 +89,58 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Added in this order (Starlette wraps middleware in *reverse* add order,
-# so CORSMiddleware -- added last -- ends up outermost, MaxUploadBodySize
-# next, DemoKey innermost, then routes):
+# so CORSMiddleware -- added last -- ends up outermost, followed by the
+# ordinary-body, upload-body, token, and demo-key guards, then routes):
 #   1. DemoKeyMiddleware: header check, no body access.
-#   2. MaxUploadBodySizeMiddleware: rejects an oversized /documents/upload
+#   2. SessionTokenLengthMiddleware: rejects an oversized public session
+#      token before any route can use it in a database lookup.
+#   3. MaxUploadBodySizeMiddleware: rejects an oversized /documents/upload
 #      request as bytes arrive, before Starlette's own multipart parser
 #      (which has no size cap for actual file parts) buffers the whole
 #      thing -- see api/middleware.py's docstring. Placed before DemoKey in
 #      wrapping order (i.e. checked first) so an oversized request is
 #      rejected without spending any effort on the demo-key check.
-#   3. CORSMiddleware outermost so a 401/413 either of the above produces
+#   4. MaxRequestBodySizeMiddleware: gives all other request bodies a smaller
+#      ASGI-level ceiling before FastAPI buffers JSON for validation; uploads
+#      are excluded so their separate practical limit remains authoritative.
+#   5. CORSMiddleware outermost so a 400/401/413 from the above produces
 #      still carries CORS headers a browser JS client can actually read.
 app.add_middleware(DemoKeyMiddleware)
+app.add_middleware(SessionTokenLengthMiddleware)
 app.add_middleware(MaxUploadBodySizeMiddleware, path_prefix="/documents/upload")
+app.add_middleware(MaxRequestBodySizeMiddleware, excluded_path_prefixes=("/documents/upload",))
+app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=settings.CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Demo-Key", "X-Session-Token"],
 )
 
 app.include_router(chat.router)
 app.include_router(conversations.router)
 app.include_router(documents.router)
+
+
+@app.get("/healthz", include_in_schema=False)
+def healthz() -> dict[str, str]:
+    """Process liveness check; it deliberately avoids model and database work."""
+    return {"status": "ok"}
+
+
+@app.get("/readyz", include_in_schema=False)
+def readyz(response: Response) -> dict[str, str | int]:
+    """Deployment readiness requires warmed models and a usable curated corpus."""
+    session = get_session()
+    try:
+        document_count = session.query(Document).filter(Document.status == "ready").count()
+    finally:
+        session.close()
+    if not getattr(app.state, "ready", False) or document_count == 0:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {"status": "not_ready", "documents": document_count}
+    return {"status": "ready", "documents": document_count}
+
 
 # `app.frontend()` (not a plain `app.mount(StaticFiles(...))`) registers the
 # built frontend as explicitly *low-priority*: FastAPI checks /chat,

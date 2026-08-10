@@ -5,9 +5,13 @@ only consumer right now is the CLI's `ask --conversation` flow; a future API
 layer can import these same functions directly.
 """
 
+import hashlib
 import secrets
 from dataclasses import dataclass
 
+from sqlalchemy import or_
+
+from config import settings
 from sage.db.database import get_session
 from sage.db.models import Conversation, Message
 
@@ -32,11 +36,23 @@ def create_conversation(
     session = get_session()
     try:
         token = session_token or secrets.token_urlsafe(32)
-        conversation = Conversation(title=title, session_token=token)
+        _prune_oldest_conversations(
+            session,
+            session.query(Conversation)
+            .filter(_session_token_filter(token))
+            .order_by(Conversation.created_at, Conversation.id),
+            settings.MAX_CONVERSATIONS_PER_SESSION - 1,
+        )
+        _prune_oldest_conversations(
+            session,
+            session.query(Conversation).order_by(Conversation.created_at, Conversation.id),
+            settings.MAX_TOTAL_CONVERSATIONS - 1,
+        )
+        conversation = Conversation(title=title, session_token=_session_token_digest(token))
         session.add(conversation)
         session.commit()
         session.refresh(conversation)
-        return conversation.id, conversation.session_token
+        return conversation.id, token
     finally:
         session.close()
 
@@ -65,11 +81,51 @@ def append_message(
             ordered=next_order,
         )
         session.add(message)
+        session.flush()
+        if role == "assistant":
+            _prune_oldest_messages(session, conversation_id)
         session.commit()
         session.refresh(message)
         return message.id
     finally:
         session.close()
+
+
+def _prune_oldest_conversations(session, ordered_query, keep: int) -> None:
+    """Delete overflow before inserting one more anonymous conversation."""
+    rows = ordered_query.all()
+    overflow = max(0, len(rows) - max(0, keep))
+    for row in rows[:overflow]:
+        session.delete(row)
+    if overflow:
+        session.flush()
+
+
+def _prune_oldest_messages(session, conversation_id: int) -> None:
+    """Keep the latest complete turns and restore dense display ordering."""
+    rows = (
+        session.query(Message)
+        .filter(Message.conversation_id == conversation_id)
+        .order_by(Message.ordered, Message.id)
+        .all()
+    )
+    overflow = max(0, len(rows) - max(2, settings.MAX_MESSAGES_PER_CONVERSATION))
+    # A normal turn is a user/assistant pair. Prune an even count so a
+    # successful generation never leaves an orphan assistant response.
+    if overflow % 2:
+        overflow += 1
+    for row in rows[:overflow]:
+        session.delete(row)
+    if overflow:
+        session.flush()
+        remaining = (
+            session.query(Message)
+            .filter(Message.conversation_id == conversation_id)
+            .order_by(Message.ordered, Message.id)
+            .all()
+        )
+        for ordered, row in enumerate(remaining):
+            row.ordered = ordered
 
 
 def get_history(conversation_id: int) -> list[HistoryTurn]:
@@ -99,7 +155,7 @@ def list_conversations(session_token: str | None = None) -> list[Conversation]:
     try:
         query = session.query(Conversation)
         if session_token is not None:
-            query = query.filter(Conversation.session_token == session_token)
+            query = query.filter(_session_token_filter(session_token))
         rows = query.order_by(Conversation.created_at.desc()).all()
         session.expunge_all()
         return rows
@@ -118,7 +174,7 @@ def get_conversation(conversation_id: int, session_token: str | None = None) -> 
     try:
         query = session.query(Conversation).filter(Conversation.id == conversation_id)
         if session_token is not None:
-            query = query.filter(Conversation.session_token == session_token)
+            query = query.filter(_session_token_filter(session_token))
         row = query.first()
         if row is not None:
             session.refresh(row, attribute_names=["messages"])
@@ -136,10 +192,22 @@ def conversation_belongs_to_session(conversation_id: int, session_token: str) ->
             session.query(Conversation.id)
             .filter(
                 Conversation.id == conversation_id,
-                Conversation.session_token == session_token,
+                _session_token_filter(session_token),
             )
             .first()
             is not None
         )
     finally:
         session.close()
+
+
+def _session_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _session_token_filter(token: str):
+    """Match hashed new rows plus legacy plaintext rows during migration."""
+    return or_(
+        Conversation.session_token == _session_token_digest(token),
+        Conversation.session_token == token,
+    )
