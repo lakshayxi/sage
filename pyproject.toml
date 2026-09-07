@@ -4,28 +4,28 @@ version = "0.1.0"
 description = "Sage — an AI-native financial research workspace (backend/CLI core)"
 requires-python = ">=3.11"
 dependencies = [
-    "google-genai>=1.0",
-    "pymupdf>=1.24",
+    "google-genai>=2.22.0",
+    "pymupdf>=1.28.2",
     "chromadb>=0.5",
-    "sqlalchemy>=2.0",
+    "sqlalchemy>=2.0.52",
     "rank-bm25>=0.2",
-    "sentence-transformers>=3.0",
+    "sentence-transformers>=6.0.1",
     # >=0.138 for app.frontend() (api/main.py) -- shipped in FastAPI 0.138.0
     # (2026-06-20); anything older doesn't have this method at all and fails
     # at import time with AttributeError, not a graceful degradation.
-    "fastapi>=0.138",
-    "uvicorn[standard]>=0.30",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.4",
     "slowapi>=0.1.9",
     "python-multipart>=0.0.9",
-    "python-dotenv>=1.0",
+    "python-dotenv>=1.2.3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.6",
-    "fpdf2>=2.7",
-    "huggingface_hub>=0.25",
+    "ruff>=0.16.6",
+    "fpdf2>=2.8.8",
+    "huggingface_hub>=1.30.0",
 ]
 
 [tool.ruff]
@@ -40,7 +40,7 @@ sage = "sage.cli:main"
 sage-eval = "eval.run_eval:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=84.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
