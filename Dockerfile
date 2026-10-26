@@ -27,7 +27,7 @@ RUN npm run build
 # sqlite3>=3.35, and older Debian bases have shipped sqlite3 older than that,
 # which fails at import time with "unsupported version of sqlite3". Mirrors
 # the same pin in the sibling reference project's Dockerfile.
-FROM python:3.11-slim-bookworm@sha256:d29f48a31a8b408ed19272ca1e7b10ebae13b240a27e862d3d4217c528e2e0c3
+FROM python:3.15-slim-bookworm@sha256:575f8bc12ec26542e0678bc6b60e385218248019d433157ec327264a78c3a853
 
 # HF Spaces containers run as uid 1000 -- create that exact user and set its
 # WORKDIR before any COPY, per HF's Docker Spaces permissions guidance
